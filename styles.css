@@ -114,3 +114,7 @@ input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(24
   .section-head .primary,.section-head .ghost{min-height:38px;padding:0 10px;font-size:12px}
   .price-value{font-size:19px}
 }
+
+.backend-good{color:#91f3a8!important}
+.backend-warn{color:#ffe08c!important}
+.backend-bad{color:#ff736b!important}
