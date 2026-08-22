@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0b0d12" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Price Watch" />
+  <title>Price Watch</title>
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="./icons/icon-192.png" />
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">BINANCE SPOT</p>
+        <h1>Price Watch</h1>
+      </div>
+      <div class="status-pill" id="connectionStatus"><span class="dot"></span><span>连接中</span></div>
+    </header>
+
+    <section class="panel">
+      <div class="section-head">
+        <div>
+          <h2>实时价格</h2>
+          <p>约 1 秒更新一次</p>
+        </div>
+        <button class="ghost" id="addSymbolBtn" type="button">＋ 添加币种</button>
+      </div>
+      <div class="price-list" id="priceList"></div>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <div>
+          <h2>价格提醒</h2>
+          <p>提醒仅在网页或主屏幕 App 活跃时可靠</p>
+        </div>
+        <button class="primary" id="addAlertBtn" type="button">＋ 添加提醒</button>
+      </div>
+      <div class="alert-list" id="alertList"></div>
+    </section>
+
+    <section class="panel compact-panel">
+      <div class="settings-row">
+        <div>
+          <strong>本机通知</strong>
+          <span id="notificationHint">需要你主动授权</span>
+        </div>
+        <button class="ghost" id="notificationBtn" type="button">开启通知</button>
+      </div>
+      <div class="settings-row">
+        <div>
+          <strong>提醒声音</strong>
+          <span>触发提醒时播放提示音</span>
+        </div>
+        <label class="switch">
+          <input id="soundToggle" type="checkbox" checked />
+          <span></span>
+        </label>
+      </div>
+    </section>
+
+    <p class="footnote">第一版为前台实时监控。iPad 锁屏或系统挂起网页后，价格检查可能停止。后台锁屏推送需要第二阶段接入服务端 Web Push。</p>
+  </main>
+
+  <dialog id="symbolDialog">
+    <form method="dialog" id="symbolForm" class="dialog-card">
+      <div class="dialog-title">
+        <div>
+          <p class="eyebrow">WATCHLIST</p>
+          <h3>添加交易对</h3>
+        </div>
+        <button class="icon-btn" value="cancel" aria-label="关闭" type="submit">×</button>
+      </div>
+      <label>币种或交易对
+        <input id="symbolInput" autocomplete="off" placeholder="例如 ETH、ETHUSDT、ETH/USDT" />
+      </label>
+      <p class="help">只输入 ETH 时，会自动转换为 ETHUSDT。</p>
+      <button class="primary full" id="confirmSymbolBtn" value="default" type="submit">添加</button>
+    </form>
+  </dialog>
+
+  <dialog id="alertDialog">
+    <form method="dialog" id="alertForm" class="dialog-card">
+      <div class="dialog-title">
+        <div>
+          <p class="eyebrow">PRICE ALERT</p>
+          <h3>添加提醒</h3>
+        </div>
+        <button class="icon-btn" value="cancel" aria-label="关闭" type="submit">×</button>
+      </div>
+      <label>交易对
+        <select id="alertSymbol"></select>
+      </label>
+      <label>条件
+        <select id="alertDirection">
+          <option value="above">价格 ≥</option>
+          <option value="below">价格 ≤</option>
+        </select>
+      </label>
+      <label>目标价格
+        <input id="alertPrice" inputmode="decimal" type="number" min="0" step="any" placeholder="例如 5000" />
+      </label>
+      <button class="primary full" id="confirmAlertBtn" value="default" type="submit">保存提醒</button>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="./app.js" defer></script>
+</body>
+</html>
