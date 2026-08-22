@@ -4,14 +4,16 @@ const STORAGE = {
   sound: 'pricewatch_sound_v1',
   backendUrl: 'pricewatch_backend_url_v2',
   backendToken: 'pricewatch_backend_token_v2',
-  clientId: 'pricewatch_client_id_v2'
+  clientId: 'pricewatch_client_id_v2',
+  markets: 'pricewatch_markets_v3'
 };
 
 const DEFAULT_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
 let symbols = loadJSON(STORAGE.symbols, DEFAULT_SYMBOLS);
 let alerts = loadJSON(STORAGE.alerts, []);
+let markets = loadJSON(STORAGE.markets, {});
 let prices = {};
-let socket = null;
+let sockets = { spot: null, futures: null };
 let reconnectTimer = null;
 let toastTimer = null;
 let audioCtx = null;
@@ -48,7 +50,40 @@ function backendConfig() {
 function saveState(sync = true) {
   localStorage.setItem(STORAGE.symbols, JSON.stringify(symbols));
   localStorage.setItem(STORAGE.alerts, JSON.stringify(alerts));
+  localStorage.setItem(STORAGE.markets, JSON.stringify(markets));
   if (sync) scheduleBackendSync();
+}
+function marketLabel(symbol) {
+  if (markets[symbol] === 'futures') return 'Binance USDⓈ-M Futures';
+  if (markets[symbol] === 'spot') return 'Binance Spot';
+  return '正在识别市场…';
+}
+async function fetchWithTimeout(url, timeout=7000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try { return await fetch(url, { cache:'no-store', signal:controller.signal }); }
+  finally { clearTimeout(timer); }
+}
+async function detectMarket(symbol, force=false) {
+  if (!force && (markets[symbol] === 'spot' || markets[symbol] === 'futures')) return markets[symbol];
+  let networkError = false;
+  try {
+    const r = await fetchWithTimeout(`https://api.binance.com/api/v3/ticker/price?symbol=${encodeURIComponent(symbol)}`);
+    if (r.ok) { const d = await r.json(); if (Number.isFinite(Number(d.price))) { markets[symbol] = 'spot'; saveState(false); return 'spot'; } }
+  } catch { networkError = true; }
+  try {
+    const r = await fetchWithTimeout(`https://fapi.binance.com/fapi/v1/ticker/price?symbol=${encodeURIComponent(symbol)}`);
+    if (r.ok) { const d = await r.json(); if (Number.isFinite(Number(d.price))) { markets[symbol] = 'futures'; saveState(false); return 'futures'; } }
+  } catch { networkError = true; }
+  if (networkError) throw new Error('暂时无法识别交易对市场，请检查网络后重试');
+  throw new Error(`${symbol} 在 Binance Spot / USDⓈ-M Futures 中未找到`);
+}
+async function resolveMarkets() {
+  await Promise.all(symbols.map(async symbol => {
+    if (markets[symbol] === 'spot' || markets[symbol] === 'futures') return;
+    try { await detectMarket(symbol); } catch (e) { console.warn('Market detection failed', symbol, e); }
+  }));
+  renderPrices();
 }
 function normalizeSymbol(input) {
   let value = String(input || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
@@ -70,7 +105,7 @@ function renderPrices() {
     const card = document.createElement('div'); card.className = 'price-card';
     const changeClass = change > 0 ? 'up' : change < 0 ? 'down' : '';
     const changeText = change == null ? '等待行情…' : `${change > 0 ? '+' : ''}${change.toFixed(2)}% · 24h`;
-    card.innerHTML = `<div class="price-main"><div><div class="symbol">${symbol}</div><div class="pair-sub">Binance Spot</div></div><div><div class="price-value">${data ? '$'+formatPrice(data.price) : '—'}</div><div class="change ${changeClass}">${changeText}</div></div></div><div class="row-actions"><button class="ghost" data-action="quick-alert" data-symbol="${symbol}">设提醒</button><button class="danger" data-action="remove-symbol" data-symbol="${symbol}">移除</button></div>`;
+    card.innerHTML = `<div class="price-main"><div><div class="symbol">${symbol}</div><div class="pair-sub">${marketLabel(symbol)}</div></div><div><div class="price-value">${data ? '$'+formatPrice(data.price) : '—'}</div><div class="change ${changeClass}">${changeText}</div></div></div><div class="row-actions"><button class="ghost" data-action="quick-alert" data-symbol="${symbol}">设提醒</button><button class="danger" data-action="remove-symbol" data-symbol="${symbol}">移除</button></div>`;
     el.priceList.appendChild(card);
   });
 }
@@ -91,21 +126,49 @@ function renderAlertSymbolOptions(preselect) {
   if (preselect && symbols.includes(preselect)) el.alertSymbol.value = preselect;
 }
 function setConnection(state, text) { el.connectionStatus.className = `status-pill ${state}`; el.connectionStatus.querySelector('span:last-child').textContent = text; }
-function connectSocket() {
-  clearTimeout(reconnectTimer); if (socket) { socket.onclose = null; socket.close(); }
+function closeSockets() {
+  for (const key of ['spot','futures']) {
+    const ws = sockets[key];
+    if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
+    sockets[key] = null;
+  }
+}
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connectSocket, 3000);
+}
+function handleTicker(data, market) {
+  const symbol = data?.s;
+  if (!symbol || !symbols.includes(symbol) || markets[symbol] !== market) return;
+  const price = Number(data.c), open = Number(data.o);
+  if (!Number.isFinite(price)) return;
+  prices[symbol] = { price, open, high:Number(data.h), low:Number(data.l), changePct:open ? ((price-open)/open)*100 : 0, updatedAt:Date.now(), market };
+  renderPrices(); renderAlerts(); checkAlerts(symbol, price);
+}
+function openMarketSocket(market, marketSymbols) {
+  if (!marketSymbols.length) return;
+  const streams = marketSymbols.map(s=>`${s.toLowerCase()}@miniTicker`).join('/');
+  const url = market === 'spot'
+    ? `wss://stream.binance.com:9443/stream?streams=${streams}`
+    : `wss://fstream.binance.com/market/stream?streams=${streams}`;
+  const ws = new WebSocket(url); sockets[market] = ws;
+  ws.onopen = () => setConnection('online','实时');
+  ws.onmessage = event => { try { const msg=JSON.parse(event.data), data=msg.data||msg; handleTicker(data,market); } catch(e) { console.warn('Ticker parse error',market,e); } };
+  ws.onerror = () => setConnection('offline','连接异常');
+  ws.onclose = () => scheduleReconnect();
+}
+async function connectSocket() {
+  clearTimeout(reconnectTimer); closeSockets();
   if (!symbols.length) { setConnection('offline','无交易对'); return; }
+  setConnection('','识别市场');
+  await resolveMarkets();
+  const spot = symbols.filter(s=>markets[s]==='spot');
+  const futures = symbols.filter(s=>markets[s]==='futures');
+  const unresolved = symbols.filter(s=>!markets[s]);
+  if (!spot.length && !futures.length) { setConnection('offline', unresolved.length ? '市场未识别' : '无交易对'); return; }
   setConnection('','连接中');
-  socket = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${symbols.map(s=>`${s.toLowerCase()}@miniTicker`).join('/')}`);
-  socket.onopen = () => setConnection('online','实时');
-  socket.onmessage = event => { try {
-    const msg = JSON.parse(event.data), data = msg.data || msg, symbol = data.s;
-    if (!symbol || !symbols.includes(symbol)) return;
-    const price = Number(data.c), open = Number(data.o);
-    prices[symbol] = { price, open, high:Number(data.h), low:Number(data.l), changePct:open ? ((price-open)/open)*100 : 0, updatedAt:Date.now() };
-    renderPrices(); renderAlerts(); checkAlerts(symbol, price);
-  } catch(e) { console.warn('Ticker parse error', e); } };
-  socket.onerror = () => setConnection('offline','连接异常');
-  socket.onclose = () => { setConnection('offline','重连中'); reconnectTimer = setTimeout(connectSocket,3000); };
+  openMarketSocket('spot', spot);
+  openMarketSocket('futures', futures);
 }
 function checkAlerts(symbol, price) {
   let changed = false;
@@ -180,10 +243,10 @@ async function refreshBackendStatus() {
 }
 
 el.addSymbolBtn.addEventListener('click',()=>{ el.symbolInput.value=''; el.symbolDialog.showModal(); setTimeout(()=>el.symbolInput.focus(),80); });
-el.symbolForm.addEventListener('submit',event=>{ const submitter=event.submitter; if(!submitter||submitter.value==='cancel') return; event.preventDefault(); const symbol=normalizeSymbol(el.symbolInput.value); if(!symbol)return showToast('请输入交易对'); if(symbols.includes(symbol))return showToast(`${symbol} 已经在列表里`); symbols.push(symbol); saveState(); renderPrices(); renderAlertSymbolOptions(); connectSocket(); el.symbolDialog.close(); showToast(`已添加 ${symbol}`); });
+el.symbolForm.addEventListener('submit',async event=>{ const submitter=event.submitter; if(!submitter||submitter.value==='cancel') return; event.preventDefault(); const symbol=normalizeSymbol(el.symbolInput.value); if(!symbol)return showToast('请输入交易对'); if(symbols.includes(symbol))return showToast(`${symbol} 已经在列表里`); const oldText=submitter.textContent; submitter.disabled=true; submitter.textContent='识别市场…'; try { const market=await detectMarket(symbol,true); symbols.push(symbol); saveState(); renderPrices(); renderAlertSymbolOptions(); await connectSocket(); el.symbolDialog.close(); showToast(`已添加 ${symbol} · ${market==='spot'?'Spot':'USDⓈ-M Futures'}`); } catch(e) { showToast(e.message||'无法添加交易对'); } finally { submitter.disabled=false; submitter.textContent=oldText; } });
 el.addAlertBtn.addEventListener('click',()=>{ if(!symbols.length)return showToast('请先添加至少一个交易对'); renderAlertSymbolOptions(); el.alertPrice.value=''; el.alertDirection.value='above'; el.alertDialog.showModal(); });
 el.alertForm.addEventListener('submit',event=>{ const submitter=event.submitter; if(!submitter||submitter.value==='cancel')return; event.preventDefault(); const target=Number(el.alertPrice.value); if(!Number.isFinite(target)||target<=0)return showToast('请输入有效目标价格'); alerts.unshift({id:crypto.randomUUID?crypto.randomUUID():`${Date.now()}-${Math.random()}`,symbol:el.alertSymbol.value,direction:el.alertDirection.value,target,enabled:true,triggered:false,createdAt:Date.now()}); saveState(); renderAlerts(); el.alertDialog.close(); showToast('提醒已保存'); });
-el.priceList.addEventListener('click',event=>{ const btn=event.target.closest('button'); if(!btn)return; const symbol=btn.dataset.symbol; if(btn.dataset.action==='remove-symbol'){ symbols=symbols.filter(s=>s!==symbol); alerts=alerts.filter(a=>a.symbol!==symbol); delete prices[symbol]; saveState(); renderPrices(); renderAlerts(); renderAlertSymbolOptions(); connectSocket(); showToast(`已移除 ${symbol}`); } if(btn.dataset.action==='quick-alert'){ renderAlertSymbolOptions(symbol); const current=prices[symbol]?.price; el.alertPrice.value=current?String(current):''; el.alertDirection.value='above'; el.alertDialog.showModal(); } });
+el.priceList.addEventListener('click',event=>{ const btn=event.target.closest('button'); if(!btn)return; const symbol=btn.dataset.symbol; if(btn.dataset.action==='remove-symbol'){ symbols=symbols.filter(s=>s!==symbol); alerts=alerts.filter(a=>a.symbol!==symbol); delete prices[symbol]; delete markets[symbol]; saveState(); renderPrices(); renderAlerts(); renderAlertSymbolOptions(); connectSocket(); showToast(`已移除 ${symbol}`); } if(btn.dataset.action==='quick-alert'){ renderAlertSymbolOptions(symbol); const current=prices[symbol]?.price; el.alertPrice.value=current?String(current):''; el.alertDirection.value='above'; el.alertDialog.showModal(); } });
 el.alertList.addEventListener('click',event=>{ const btn=event.target.closest('button'); if(!btn)return; const id=btn.dataset.id, alert=alerts.find(a=>a.id===id); if(btn.dataset.action==='delete-alert') alerts=alerts.filter(a=>a.id!==id); if(btn.dataset.action==='toggle-alert'&&alert){ const shouldEnable=alert.triggered||!alert.enabled; alert.enabled=shouldEnable; if(shouldEnable){ alert.triggered=false; delete alert.triggeredAt; } } saveState(); renderAlerts(); });
 
 async function updateNotificationUI(){ if(!('Notification' in window)){el.notificationBtn.disabled=true;el.notificationBtn.textContent='不支持';el.notificationHint.textContent='当前环境不支持 Notification API';return;} const p=Notification.permission; if(p==='granted'){el.notificationBtn.textContent='已开启';el.notificationHint.textContent='前台与 Web Push 都可使用';} else if(p==='denied'){el.notificationBtn.textContent='已拒绝';el.notificationHint.textContent='请到系统通知设置中重新授权';} else {el.notificationBtn.textContent='开启通知';el.notificationHint.textContent='需要你主动授权';}}
@@ -195,7 +258,7 @@ el.backendForm.addEventListener('submit',async event=>{ const submitter=event.su
 el.backendTestBtn.addEventListener('click',async()=>{ try{el.backendTestBtn.disabled=true;await backendFetch('/api/test',{method:'POST',body:JSON.stringify({clientId:getClientId()})});showToast('测试推送已发送');}catch(e){showToast(e.message||'测试失败');}finally{el.backendTestBtn.disabled=false;} });
 
 window.addEventListener('online',()=>{connectSocket();refreshBackendStatus();}); window.addEventListener('offline',()=>setConnection('offline','离线'));
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){if(!socket||socket.readyState>1)connectSocket();refreshBackendStatus();}});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){const active=Object.values(sockets).some(ws=>ws&&ws.readyState===1);if(!active)connectSocket();refreshBackendStatus();}});
 if('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').then(()=>refreshBackendStatus()).catch(console.warn));
 
 renderPrices(); renderAlerts(); renderAlertSymbolOptions(); updateNotificationUI(); connectSocket(); getClientId();

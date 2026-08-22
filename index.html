@@ -26,7 +26,7 @@
       <div class="section-head">
         <div>
           <h2>实时价格</h2>
-          <p>前台约 1 秒更新一次</p>
+          <p>Spot 约 1 秒、Futures 约 2 秒更新</p>
         </div>
         <button class="ghost" id="addSymbolBtn" type="button">＋ 添加币种</button>
       </div>
@@ -78,7 +78,7 @@
       </div>
     </section>
 
-    <p class="footnote">前台保持 Binance WebSocket 实时监控。后台连接成功后，由 Cloudflare 大约每 1 分钟检查一次价格。两边共用同一组提醒，已触发提醒会同步为关闭状态。</p>
+    <p class="footnote">前台自动识别 Binance Spot / USDⓈ-M Futures 并使用对应 WebSocket 实时监控。后台连接成功后，由 Cloudflare 大约每 1 分钟检查一次价格。两边共用同一组提醒，已触发提醒会同步为关闭状态。</p>
   </main>
 
   <dialog id="symbolDialog">
@@ -90,7 +90,7 @@
       <label>币种或交易对
         <input id="symbolInput" autocomplete="off" placeholder="例如 ETH、ETHUSDT、ETH/USDT" />
       </label>
-      <p class="help">只输入 ETH 时，会自动转换为 ETHUSDT。</p>
+      <p class="help">只输入 ETH 时会自动转换为 ETHUSDT，并自动识别 Binance Spot 或 USDⓈ-M Futures。</p>
       <button class="primary full" value="default" type="submit">添加</button>
     </form>
   </dialog>
