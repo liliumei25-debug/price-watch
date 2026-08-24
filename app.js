@@ -10,6 +10,8 @@ const STORAGE = {
 
 const VAPID_PUBLIC_KEY = 'BDOPB7t_5ss8hWCqrcCZO-fj3CM87At5ytLrA-dcek75GptW7kg-ZD3XC2i9vMHeMN2f3jQ_0FC2bMajAG-NzrE';
 const DEFAULT_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
+// Binance TradFi USDⓈ-M perpetuals that should be treated as futures even when REST market detection is unavailable.
+const KNOWN_FUTURES_SYMBOLS = new Set(['XAUUSDT', 'XAGUSDT', 'COPPERUSDT']);
 let symbols = loadJSON(STORAGE.symbols, DEFAULT_SYMBOLS);
 let alerts = loadJSON(STORAGE.alerts, []);
 let markets = loadJSON(STORAGE.markets, {});
@@ -71,6 +73,14 @@ async function fetchWithTimeout(url, timeout=7000) {
 }
 async function detectMarket(symbol, force=false) {
   if (!force && (markets[symbol] === 'spot' || markets[symbol] === 'futures')) return markets[symbol];
+
+  // Gold/silver/copper TradFi perps are known USDⓈ-M Futures symbols.
+  // This prevents a temporary REST/network failure from leaving them permanently 'unrecognized'.
+  if (KNOWN_FUTURES_SYMBOLS.has(symbol)) {
+    markets[symbol] = 'futures';
+    saveState(false);
+    return 'futures';
+  }
 
   // 已配置 Cloudflare 后台时，优先通过中转识别市场。这样前端无需直连 Binance。
   const cfg = backendConfig();
@@ -149,6 +159,25 @@ function normalizeSymbol(input) {
   if (!commonQuotes.some(q => value.endsWith(q))) value += 'USDT';
   return value;
 }
+
+function migrateLegacySymbols() {
+  // Older builds could save a bare symbol such as 'ETH'. Normalize existing local data once on startup.
+  const normalizedSymbols = [...new Set((symbols || []).map(normalizeSymbol).filter(Boolean))];
+  const normalizedMarkets = {};
+  for (const [key, value] of Object.entries(markets || {})) {
+    const normalized = normalizeSymbol(key);
+    if (normalized && (value === 'spot' || value === 'futures')) normalizedMarkets[normalized] = value;
+  }
+  alerts = (alerts || []).map(a => ({...a, symbol: normalizeSymbol(a.symbol)})).filter(a => a.symbol);
+  symbols = normalizedSymbols;
+  markets = normalizedMarkets;
+  // Known TradFi symbols should always be marked futures locally.
+  for (const symbol of symbols) if (KNOWN_FUTURES_SYMBOLS.has(symbol)) markets[symbol] = 'futures';
+  localStorage.setItem(STORAGE.symbols, JSON.stringify(symbols));
+  localStorage.setItem(STORAGE.alerts, JSON.stringify(alerts));
+  localStorage.setItem(STORAGE.markets, JSON.stringify(markets));
+}
+migrateLegacySymbols();
 function formatPrice(n) {
   const value = Number(n); if (!Number.isFinite(value)) return '—';
   const digits = value >= 1000 ? 2 : value >= 1 ? 4 : value >= 0.01 ? 5 : 8;
@@ -202,22 +231,57 @@ function handleTicker(data, market) {
   prices[symbol] = { price, open, high:Number(data.h), low:Number(data.l), changePct:open ? ((price-open)/open)*100 : 0, updatedAt:Date.now(), market };
   renderPrices(); renderAlerts(); checkAlerts(symbol, price);
 }
-function openMarketSocket(market, marketSymbols) {
+function openMarketSocket(market, marketSymbols, candidateIndex=0) {
   if (!marketSymbols.length) return;
   const streams = marketSymbols.map(s=>`${s.toLowerCase()}@miniTicker`).join('/');
-  // Spot 优先使用 Binance 官方 market-data-only 域名；它只提供公开行情。
-  // Futures 仍使用 Binance USDⓈ-M 官方公共流。Cloudflare 中转会同时作为兜底。
-  const url = market === 'spot'
-    ? `wss://data-stream.binance.vision:443/stream?streams=${streams}`
-    : `wss://fstream.binance.com/stream?streams=${streams}`;
+  const urls = market === 'spot'
+    ? [`wss://data-stream.binance.vision:443/stream?streams=${streams}`, `wss://stream.binance.com:443/stream?streams=${streams}`]
+    : [
+        // Current Binance Futures public market-stream route after the derivatives stream migration.
+        `wss://fstream.binance.com/public/stream?streams=${streams}`,
+        // Some Binance documentation/localized endpoints expose the same stream under /market during migration.
+        `wss://fstream.binance.com/market/stream?streams=${streams}`,
+        // Legacy route kept only as the final compatibility fallback.
+        `wss://fstream.binance.com/stream?streams=${streams}`
+      ];
+  const url = urls[Math.min(candidateIndex, urls.length-1)];
   const ws = new WebSocket(url); sockets[market] = ws;
-  ws.onopen = () => setConnection('online','实时');
-  ws.onmessage = event => { try { const msg=JSON.parse(event.data), data=msg.data||msg; handleTicker(data,market); } catch(e) { console.warn('Ticker parse error',market,e); } };
+  let gotTicker = false;
+  let fallbackTimer = null;
+  ws.onopen = () => {
+    setConnection('online','实时');
+    // If a route opens but never delivers a ticker, try the next documented route.
+    fallbackTimer = setTimeout(() => {
+      if (!gotTicker && candidateIndex + 1 < urls.length && sockets[market] === ws) {
+        ws.onclose = null;
+        try { ws.close(); } catch {}
+        openMarketSocket(market, marketSymbols, candidateIndex + 1);
+      }
+    }, 4500);
+  };
+  ws.onmessage = event => {
+    try {
+      const msg=JSON.parse(event.data), data=msg.data||msg;
+      const before=prices[data?.s]?.updatedAt||0;
+      handleTicker(data,market);
+      if ((prices[data?.s]?.updatedAt||0) > before) {
+        gotTicker = true;
+        clearTimeout(fallbackTimer);
+      }
+    } catch(e) { console.warn('Ticker parse error',market,e); }
+  };
   ws.onerror = () => {
     const fresh = Object.values(prices).some(p=>p?.updatedAt && Date.now()-p.updatedAt<10000);
     if (!fresh) setConnection('offline','直连异常');
   };
-  ws.onclose = () => scheduleReconnect();
+  ws.onclose = () => {
+    clearTimeout(fallbackTimer);
+    if (!gotTicker && candidateIndex + 1 < urls.length) {
+      setTimeout(() => openMarketSocket(market, marketSymbols, candidateIndex + 1), 250);
+    } else {
+      scheduleReconnect();
+    }
+  };
 }
 function stopBackendQuotePolling() {
   clearTimeout(quotePollTimer);
