@@ -11,18 +11,21 @@ const STORAGE = {
 const VAPID_PUBLIC_KEY = 'BDOPB7t_5ss8hWCqrcCZO-fj3CM87At5ytLrA-dcek75GptW7kg-ZD3XC2i9vMHeMN2f3jQ_0FC2bMajAG-NzrE';
 const DEFAULT_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
 // Binance TradFi USDⓈ-M perpetuals that should be treated as futures even when REST market detection is unavailable.
-const KNOWN_FUTURES_SYMBOLS = new Set(['XAUUSDT', 'XAGUSDT', 'COPPERUSDT']);
+const KNOWN_FUTURES_SYMBOLS = new Set(['XAUUSDT', 'XAGUSDT', 'XPTUSDT', 'XPDUSDT', 'COPPERUSDT']);
+const TRADFI_SYMBOLS = new Set(['XAUUSDT', 'XAGUSDT', 'XPTUSDT', 'XPDUSDT', 'COPPERUSDT']);
 let symbols = loadJSON(STORAGE.symbols, DEFAULT_SYMBOLS);
 let alerts = loadJSON(STORAGE.alerts, []);
 let markets = loadJSON(STORAGE.markets, {});
 let prices = {};
-let sockets = { spot: null, futures: null };
+let sockets = { spot: null, futures: null, tradfi: null };
 let reconnectTimer = null;
 let toastTimer = null;
 let audioCtx = null;
 let backendSyncTimer = null;
 let quotePollTimer = null;
 let quotePollBusy = false;
+let futuresRestTimer = null;
+let futuresRestBusy = false;
 let undoTimer = null;
 let undoAction = null;
 
@@ -61,7 +64,7 @@ function saveState(sync = true) {
   if (sync) scheduleBackendSync();
 }
 function marketLabel(symbol) {
-  if (markets[symbol] === 'futures') return 'Binance USDⓈ-M Futures';
+  if (markets[symbol] === 'futures') return TRADFI_SYMBOLS.has(symbol) ? 'Binance TradFi Futures' : 'Binance USDⓈ-M Futures';
   if (markets[symbol] === 'spot') return 'Binance Spot';
   return '正在识别市场…';
 }
@@ -213,7 +216,7 @@ function renderAlertSymbolOptions(preselect) {
 }
 function setConnection(state, text) { el.connectionStatus.className = `status-pill ${state}`; el.connectionStatus.querySelector('span:last-child').textContent = text; }
 function closeSockets() {
-  for (const key of ['spot','futures']) {
+  for (const key of ['spot','futures','tradfi']) {
     const ws = sockets[key];
     if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
     sockets[key] = null;
@@ -233,15 +236,13 @@ function handleTicker(data, market) {
 }
 function openMarketSocket(market, marketSymbols, candidateIndex=0) {
   if (!marketSymbols.length) return;
-  const streams = marketSymbols.map(s=>`${s.toLowerCase()}@miniTicker`).join('/');
+  const streams = marketSymbols.map(s=>`${s.toLowerCase()}@${market==='futures'?'ticker':'miniTicker'}`).join('/');
   const urls = market === 'spot'
     ? [`wss://data-stream.binance.vision:443/stream?streams=${streams}`, `wss://stream.binance.com:443/stream?streams=${streams}`]
     : [
-        // Current Binance Futures public market-stream route after the derivatives stream migration.
-        `wss://fstream.binance.com/public/stream?streams=${streams}`,
-        // Some Binance documentation/localized endpoints expose the same stream under /market during migration.
+        // Current Binance ticker streams are documented under /market.
         `wss://fstream.binance.com/market/stream?streams=${streams}`,
-        // Legacy route kept only as the final compatibility fallback.
+        `wss://fstream.binance.com/public/stream?streams=${streams}`,
         `wss://fstream.binance.com/stream?streams=${streams}`
       ];
   const url = urls[Math.min(candidateIndex, urls.length-1)];
@@ -282,6 +283,103 @@ function openMarketSocket(market, marketSymbols, candidateIndex=0) {
       scheduleReconnect();
     }
   };
+}
+
+function handleTradFiKline(data) {
+  const symbol = String(data?.ps || '').toUpperCase();
+  const k = data?.k;
+  if (!symbol || !k || !symbols.includes(symbol) || !TRADFI_SYMBOLS.has(symbol)) return;
+  const price = Number(k.c);
+  if (!Number.isFinite(price)) return;
+  const prev = prices[symbol] || {};
+  prices[symbol] = {
+    price,
+    open: Number.isFinite(Number(prev.open)) ? Number(prev.open) : Number(k.o),
+    high: Number.isFinite(Number(prev.high)) ? Math.max(Number(prev.high), Number(k.h)||price) : Number(k.h)||price,
+    low: Number.isFinite(Number(prev.low)) ? Math.min(Number(prev.low), Number(k.l)||price) : Number(k.l)||price,
+    changePct: Number.isFinite(Number(prev.changePct)) ? Number(prev.changePct) : 0,
+    updatedAt: Date.now(), market: 'futures'
+  };
+  renderPrices(); renderAlerts(); checkAlerts(symbol, price);
+}
+function openTradFiSocket(tradfiSymbols, candidateIndex=0) {
+  if (!tradfiSymbols.length) return;
+  const streams = tradfiSymbols.map(s => `${s.toLowerCase()}_tradifi_perpetual@continuousKline_1s`).join('/');
+  const urls = [
+    `wss://fstream.binance.com/market/stream?streams=${streams}`,
+    `wss://fstream.binance.com/public/stream?streams=${streams}`
+  ];
+  const url = urls[Math.min(candidateIndex, urls.length-1)];
+  const ws = new WebSocket(url); sockets.tradfi = ws;
+  let got = false;
+  let fallbackTimer = null;
+  ws.onopen = () => {
+    setConnection('online','实时');
+    fallbackTimer = setTimeout(() => {
+      if (!got && candidateIndex + 1 < urls.length && sockets.tradfi === ws) {
+        ws.onclose = null;
+        try { ws.close(); } catch {}
+        openTradFiSocket(tradfiSymbols, candidateIndex + 1);
+      }
+    }, 5000);
+  };
+  ws.onmessage = event => {
+    try {
+      const msg = JSON.parse(event.data), data = msg.data || msg;
+      const before = prices[String(data?.ps||'').toUpperCase()]?.updatedAt || 0;
+      handleTradFiKline(data);
+      const sym = String(data?.ps||'').toUpperCase();
+      if ((prices[sym]?.updatedAt||0) > before) { got = true; clearTimeout(fallbackTimer); }
+    } catch(e) { console.warn('TradFi kline parse error', e); }
+  };
+  ws.onerror = () => { if (!hasFreshPrice()) setConnection('offline','TradFi 直连异常'); };
+  ws.onclose = () => {
+    clearTimeout(fallbackTimer);
+    if (!got && candidateIndex + 1 < urls.length) setTimeout(()=>openTradFiSocket(tradfiSymbols,candidateIndex+1),250);
+    else scheduleReconnect();
+  };
+}
+function stopFuturesRestFallback() {
+  clearTimeout(futuresRestTimer);
+  futuresRestTimer = null;
+  futuresRestBusy = false;
+}
+function scheduleFuturesRestFallback(delay=2500) {
+  clearTimeout(futuresRestTimer);
+  if (document.visibilityState === 'hidden') return;
+  futuresRestTimer = setTimeout(pollFuturesRestFallback, delay);
+}
+async function pollFuturesRestFallback() {
+  if (futuresRestBusy) return;
+  const list = symbols.filter(s => markets[s] === 'futures' && (!prices[s]?.updatedAt || Date.now()-prices[s].updatedAt > 5000));
+  if (!list.length) { scheduleFuturesRestFallback(3000); return; }
+  futuresRestBusy = true;
+  try {
+    for (const symbol of list) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(()=>controller.abort(), 4500);
+        const bases = TRADFI_SYMBOLS.has(symbol) ? ['https://www.binance.com','https://fapi.binance.com'] : ['https://fapi.binance.com'];
+        let d = null;
+        for (const base of bases) {
+          try {
+            const res = await fetch(`${base}/fapi/v1/ticker/24hr?symbol=${encodeURIComponent(symbol)}`, {signal:controller.signal, cache:'no-store'});
+            if (res.ok) { d = await res.json(); break; }
+          } catch {}
+        }
+        clearTimeout(timer);
+        if (!d) continue;
+        const price=Number(d?.lastPrice), open=Number(d?.openPrice);
+        if (!Number.isFinite(price)) continue;
+        prices[symbol]={price,open,high:Number(d.highPrice),low:Number(d.lowPrice),changePct:Number(d.priceChangePercent)||0,updatedAt:Date.now(),market:'futures'};
+        checkAlerts(symbol,price);
+      } catch (e) { console.warn('Futures REST fallback failed',symbol,e); }
+    }
+    renderPrices(); renderAlerts();
+  } finally {
+    futuresRestBusy = false;
+    scheduleFuturesRestFallback(2500);
+  }
 }
 function stopBackendQuotePolling() {
   clearTimeout(quotePollTimer);
@@ -340,19 +438,22 @@ async function connectDirectSocket(silent=false) {
   if (!silent) setConnection('','识别市场');
   await resolveMarkets();
   const spot = symbols.filter(s=>markets[s]==='spot');
-  const futures = symbols.filter(s=>markets[s]==='futures');
+  const tradfi = symbols.filter(s=>markets[s]==='futures' && TRADFI_SYMBOLS.has(s));
+  const futures = symbols.filter(s=>markets[s]==='futures' && !TRADFI_SYMBOLS.has(s));
   const unresolved = symbols.filter(s=>!markets[s]);
-  if (!spot.length && !futures.length) {
+  if (!spot.length && !futures.length && !tradfi.length) {
     if (!silent && !hasFreshPrice()) setConnection('offline', unresolved.length ? '市场未识别' : '无交易对');
     return;
   }
   if (!silent) setConnection('','连接中');
   openMarketSocket('spot', spot);
   openMarketSocket('futures', futures);
+  openTradFiSocket(tradfi);
 }
 async function connectSocket() {
   clearTimeout(reconnectTimer);
   stopBackendQuotePolling();
+  stopFuturesRestFallback();
   closeSockets();
   if (!symbols.length) { setConnection('offline','无交易对'); return; }
 
@@ -363,9 +464,11 @@ async function connectSocket() {
     setConnection('','连接行情');
     connectDirectSocket(true).catch(e=>console.warn('Direct fallback failed',e));
     pollBackendQuotes().catch(e=>console.warn('Cloudflare polling start failed',e));
+    scheduleFuturesRestFallback(3500);
     return;
   }
   await connectDirectSocket();
+  scheduleFuturesRestFallback(3500);
 }
 
 function checkAlerts(symbol, price) {
