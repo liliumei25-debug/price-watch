@@ -17,7 +17,7 @@ let symbols = loadJSON(STORAGE.symbols, DEFAULT_SYMBOLS);
 let alerts = loadJSON(STORAGE.alerts, []);
 let markets = loadJSON(STORAGE.markets, {});
 let prices = {};
-let sockets = { spot: null, futures: null, tradfi: null };
+let sockets = { spot: null, futures: null, tradfi: null, tradfiStats: null };
 let reconnectTimer = null;
 let toastTimer = null;
 let audioCtx = null;
@@ -216,7 +216,7 @@ function renderAlertSymbolOptions(preselect) {
 }
 function setConnection(state, text) { el.connectionStatus.className = `status-pill ${state}`; el.connectionStatus.querySelector('span:last-child').textContent = text; }
 function closeSockets() {
-  for (const key of ['spot','futures','tradfi']) {
+  for (const key of Object.keys(sockets)) {
     const ws = sockets[key];
     if (ws) { ws.onclose = null; try { ws.close(); } catch {} }
     sockets[key] = null;
@@ -339,6 +339,67 @@ function openTradFiSocket(tradfiSymbols, candidateIndex=0) {
     else scheduleReconnect();
   };
 }
+
+function openTradFiStatsSocket(tradfiSymbols) {
+  if (!tradfiSymbols.length) return;
+  const urls = [
+    'wss://fstream.binance.com/market/ws/!ticker@arr',
+    'wss://fstream.binance.com/public/ws/!ticker@arr'
+  ];
+  let candidateIndex = 0;
+  const connect = () => {
+    if (!tradfiSymbols.length) return;
+    const ws = new WebSocket(urls[candidateIndex]);
+    sockets.tradfiStats = ws;
+    let got = false;
+    let fallbackTimer = null;
+    ws.onopen = () => {
+      fallbackTimer = setTimeout(() => {
+        if (!got && candidateIndex + 1 < urls.length && sockets.tradfiStats === ws) {
+          ws.onclose = null;
+          try { ws.close(); } catch {}
+          candidateIndex += 1;
+          connect();
+        }
+      }, 6000);
+    };
+    ws.onmessage = event => {
+      try {
+        const msg = JSON.parse(event.data);
+        const rows = Array.isArray(msg?.data) ? msg.data : Array.isArray(msg) ? msg : [];
+        let changed = false;
+        for (const row of rows) {
+          const symbol = String(row?.ps || row?.s || '').toUpperCase();
+          if (!tradfiSymbols.includes(symbol)) continue;
+          const price = Number(row?.c), open = Number(row?.o), pct = Number(row?.P);
+          if (!Number.isFinite(price)) continue;
+          const prev = prices[symbol] || {};
+          const changePct = Number.isFinite(pct) ? pct : (Number.isFinite(open) && open !== 0 ? ((price-open)/open)*100 : (Number(prev.changePct)||0));
+          prices[symbol] = {
+            ...prev,
+            price: Number.isFinite(Number(prev.price)) ? Number(prev.price) : price,
+            open: Number.isFinite(open) ? open : Number(prev.open),
+            high: Number.isFinite(Number(row?.h)) ? Number(row.h) : Number(prev.high),
+            low: Number.isFinite(Number(row?.l)) ? Number(row.l) : Number(prev.low),
+            changePct,
+            updatedAt: Math.max(Number(prev.updatedAt)||0, Date.now()),
+            market: 'futures'
+          };
+          got = true;
+          changed = true;
+        }
+        if (changed) { clearTimeout(fallbackTimer); renderPrices(); renderAlerts(); }
+      } catch (e) { console.warn('TradFi 24h ticker parse error', e); }
+    };
+    ws.onerror = () => {};
+    ws.onclose = () => {
+      clearTimeout(fallbackTimer);
+      if (!got && candidateIndex + 1 < urls.length) { candidateIndex += 1; setTimeout(connect, 300); }
+    };
+  };
+  connect();
+}
+
 function stopFuturesRestFallback() {
   clearTimeout(futuresRestTimer);
   futuresRestTimer = null;
@@ -449,6 +510,7 @@ async function connectDirectSocket(silent=false) {
   openMarketSocket('spot', spot);
   openMarketSocket('futures', futures);
   openTradFiSocket(tradfi);
+  openTradFiStatsSocket(tradfi);
 }
 async function connectSocket() {
   clearTimeout(reconnectTimer);
