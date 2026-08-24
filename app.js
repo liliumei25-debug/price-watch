@@ -205,13 +205,18 @@ function handleTicker(data, market) {
 function openMarketSocket(market, marketSymbols) {
   if (!marketSymbols.length) return;
   const streams = marketSymbols.map(s=>`${s.toLowerCase()}@miniTicker`).join('/');
+  // Spot 优先使用 Binance 官方 market-data-only 域名；它只提供公开行情。
+  // Futures 仍使用 Binance USDⓈ-M 官方公共流。Cloudflare 中转会同时作为兜底。
   const url = market === 'spot'
-    ? `wss://stream.binance.com:9443/stream?streams=${streams}`
+    ? `wss://data-stream.binance.vision:443/stream?streams=${streams}`
     : `wss://fstream.binance.com/stream?streams=${streams}`;
   const ws = new WebSocket(url); sockets[market] = ws;
   ws.onopen = () => setConnection('online','实时');
   ws.onmessage = event => { try { const msg=JSON.parse(event.data), data=msg.data||msg; handleTicker(data,market); } catch(e) { console.warn('Ticker parse error',market,e); } };
-  ws.onerror = () => setConnection('offline','连接异常');
+  ws.onerror = () => {
+    const fresh = Object.values(prices).some(p=>p?.updatedAt && Date.now()-p.updatedAt<10000);
+    if (!fresh) setConnection('offline','直连异常');
+  };
   ws.onclose = () => scheduleReconnect();
 }
 function stopBackendQuotePolling() {
@@ -246,6 +251,9 @@ function applyBackendQuotes(quotes) {
   renderPrices(); renderAlerts();
   return got;
 }
+function hasFreshPrice(maxAge=10000) {
+  return symbols.some(symbol => prices[symbol]?.updatedAt && Date.now()-prices[symbol].updatedAt < maxAge);
+}
 async function pollBackendQuotes() {
   if (quotePollBusy) return;
   const cfg = backendConfig();
@@ -254,23 +262,27 @@ async function pollBackendQuotes() {
   try {
     const quotes = await fetchBackendQuotes(symbols);
     const got = applyBackendQuotes(quotes);
-    setConnection(got ? 'online' : 'offline', got ? 'Cloudflare 实时' : '等待行情');
+    if (got) setConnection('online','Cloudflare 实时');
+    else if (!hasFreshPrice()) setConnection('offline','中转暂无行情');
   } catch (e) {
     console.warn('Cloudflare quote polling failed', e);
-    setConnection('offline','中转异常');
+    if (!hasFreshPrice()) setConnection('offline','中转异常');
   } finally {
     quotePollBusy = false;
     scheduleBackendQuotePoll(2000);
   }
 }
-async function connectDirectSocket() {
-  setConnection('','识别市场');
+async function connectDirectSocket(silent=false) {
+  if (!silent) setConnection('','识别市场');
   await resolveMarkets();
   const spot = symbols.filter(s=>markets[s]==='spot');
   const futures = symbols.filter(s=>markets[s]==='futures');
   const unresolved = symbols.filter(s=>!markets[s]);
-  if (!spot.length && !futures.length) { setConnection('offline', unresolved.length ? '市场未识别' : '无交易对'); return; }
-  setConnection('','连接中');
+  if (!spot.length && !futures.length) {
+    if (!silent && !hasFreshPrice()) setConnection('offline', unresolved.length ? '市场未识别' : '无交易对');
+    return;
+  }
+  if (!silent) setConnection('','连接中');
   openMarketSocket('spot', spot);
   openMarketSocket('futures', futures);
 }
@@ -280,12 +292,13 @@ async function connectSocket() {
   closeSockets();
   if (!symbols.length) { setConnection('offline','无交易对'); return; }
 
-  // 后台配置存在时，前台行情也通过 Cloudflare 中转。
-  // 这样所在网络无法直接访问 Binance 时，仍能看到约 2 秒级更新。
   const cfg = backendConfig();
   if (cfg.url && cfg.token) {
-    setConnection('','连接 Cloudflare');
-    await pollBackendQuotes();
+    // 双通道：Cloudflare 中转 + Binance 公开行情直连同时尝试。
+    // 中转失败时，有 VPN 的设备仍可自动退回直连，不会出现整页“等待行情”。
+    setConnection('','连接行情');
+    connectDirectSocket(true).catch(e=>console.warn('Direct fallback failed',e));
+    pollBackendQuotes().catch(e=>console.warn('Cloudflare polling start failed',e));
     return;
   }
   await connectDirectSocket();
