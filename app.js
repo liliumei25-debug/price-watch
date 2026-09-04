@@ -6,7 +6,8 @@ const STORAGE = {
   backendToken: 'pricewatch_backend_token_v2',
   clientId: 'pricewatch_client_id_v2',
   markets: 'pricewatch_markets_v3',
-  expandedCharts: 'pricewatch_expanded_charts_v1'
+  expandedCharts: 'pricewatch_expanded_charts_v1',
+  chartIntervals: 'pricewatch_chart_intervals_v1'
 };
 
 const VAPID_PUBLIC_KEY = 'BDOPB7t_5ss8hWCqrcCZO-fj3CM87At5ytLrA-dcek75GptW7kg-ZD3XC2i9vMHeMN2f3jQ_0FC2bMajAG-NzrE';
@@ -30,6 +31,9 @@ let futuresRestBusy = false;
 let undoTimer = null;
 let undoAction = null;
 let expandedCharts = new Set(loadJSON(STORAGE.expandedCharts, []));
+let chartIntervals = loadJSON(STORAGE.chartIntervals, {});
+const chartStates = new Map();
+let chartRefreshTimer = null;
 
 const el = {
   priceList: document.querySelector('#priceList'), alertList: document.querySelector('#alertList'),
@@ -193,47 +197,239 @@ function formatPrice(n) {
 function saveExpandedCharts() {
   localStorage.setItem(STORAGE.expandedCharts, JSON.stringify([...expandedCharts]));
 }
-function tradingViewSymbol(symbol) {
-  const market = markets[symbol] || (KNOWN_FUTURES_SYMBOLS.has(symbol) ? 'futures' : 'spot');
-  return `BINANCE:${symbol}${market === 'futures' ? '.P' : ''}`;
+const CHART_INTERVALS = ['5m','15m','30m','1h','2h','4h','1d'];
+const CHART_INTERVAL_LABELS = {'5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','1d':'1D'};
+const CHART_LIMIT = 260;
+
+function chartIntervalFor(symbol) {
+  const saved = chartIntervals?.[symbol];
+  return CHART_INTERVALS.includes(saved) ? saved : '1h';
 }
-function mountTradingViewChart(symbol, chartHost) {
-  if (!chartHost) return;
-  const tvSymbol = tradingViewSymbol(symbol);
-  if (chartHost.dataset.mountedSymbol === tvSymbol && chartHost.childElementCount) return;
-  chartHost.dataset.mountedSymbol = tvSymbol;
-  chartHost.innerHTML = '<div class="tradingview-widget-container__widget"></div>';
-  const script = document.createElement('script');
-  script.type = 'text/javascript';
-  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
-  script.async = true;
-  script.textContent = JSON.stringify({
-    autosize: true,
-    symbol: tvSymbol,
-    interval: '15',
-    timezone: 'Asia/Shanghai',
-    theme: 'dark',
-    style: '1',
-    locale: 'zh_CN',
-    backgroundColor: '#0b0d12',
-    gridColor: 'rgba(255,255,255,0.05)',
-    hide_side_toolbar: false,
-    hide_top_toolbar: false,
-    hide_legend: false,
-    hide_volume: true,
-    allow_symbol_change: true,
-    withdateranges: true,
-    save_image: false,
-    calendar: false,
-    support_host: 'https://www.tradingview.com'
+function saveChartIntervals() {
+  localStorage.setItem(STORAGE.chartIntervals, JSON.stringify(chartIntervals));
+}
+function intervalMs(interval) {
+  return ({'5m':300000,'15m':900000,'30m':1800000,'1h':3600000,'2h':7200000,'4h':14400000,'1d':86400000})[interval] || 3600000;
+}
+function chartButtonsHtml(symbol) {
+  return CHART_INTERVALS.map(i=>`<button type="button" class="chart-interval" data-action="chart-interval" data-symbol="${symbol}" data-interval="${i}">${CHART_INTERVAL_LABELS[i]}</button>`).join('');
+}
+function normalizeKlines(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map(row => {
+    if (Array.isArray(row)) return {time:Number(row[0]),open:Number(row[1]),high:Number(row[2]),low:Number(row[3]),close:Number(row[4]),volume:Number(row[5])||0,closeTime:Number(row[6])||0};
+    return {time:Number(row?.time ?? row?.openTime),open:Number(row?.open),high:Number(row?.high),low:Number(row?.low),close:Number(row?.close),volume:Number(row?.volume)||0,closeTime:Number(row?.closeTime)||0};
+  }).filter(k=>Number.isFinite(k.time)&&Number.isFinite(k.open)&&Number.isFinite(k.high)&&Number.isFinite(k.low)&&Number.isFinite(k.close)).sort((a,b)=>a.time-b.time);
+}
+async function fetchDirectKlines(symbol, interval, limit=CHART_LIMIT) {
+  const market = markets[symbol] || (KNOWN_FUTURES_SYMBOLS.has(symbol) ? 'futures' : 'spot');
+  const encoded = encodeURIComponent(symbol);
+  const common = `interval=${encodeURIComponent(interval)}&limit=${Math.max(50,Math.min(500,Number(limit)||CHART_LIMIT))}`;
+  const urls = [];
+  if (market === 'spot') {
+    urls.push(
+      `https://data-api.binance.vision/api/v3/klines?symbol=${encoded}&${common}`,
+      `https://api.binance.com/api/v3/klines?symbol=${encoded}&${common}`
+    );
+  } else {
+    urls.push(
+      `https://www.binance.com/fapi/v1/klines?symbol=${encoded}&${common}`,
+      `https://fapi.binance.com/fapi/v1/klines?symbol=${encoded}&${common}`,
+      `https://www.binance.com/fapi/v1/continuousKlines?pair=${encoded}&contractType=PERPETUAL&${common}`,
+      `https://fapi.binance.com/fapi/v1/continuousKlines?pair=${encoded}&contractType=PERPETUAL&${common}`
+    );
+  }
+  let lastError = null;
+  for (const url of urls) {
+    try {
+      const r = await fetchWithTimeout(url, 9000);
+      if (!r.ok) { lastError = new Error(`HTTP ${r.status}`); continue; }
+      const rows = normalizeKlines(await r.json());
+      if (rows.length) return rows;
+    } catch (e) { lastError = e; }
+  }
+  throw lastError || new Error('无法取得 K 线数据');
+}
+async function fetchChartKlines(symbol, interval, limit=CHART_LIMIT) {
+  const cfg = backendConfig();
+  if (cfg.url && cfg.token) {
+    try {
+      const data = await backendFetch('/api/klines', {method:'POST', body:JSON.stringify({symbol,market:markets[symbol]||'',interval,limit})});
+      const rows = normalizeKlines(data.klines);
+      if (rows.length) return rows;
+    } catch (e) {
+      console.warn('Backend kline route unavailable, trying direct Binance', symbol, interval, e);
+    }
+  }
+  return fetchDirectKlines(symbol, interval, limit);
+}
+function cleanupChartState(symbol) {
+  const state = chartStates.get(symbol);
+  if (!state) return;
+  try { state.resizeObserver?.disconnect(); } catch {}
+  chartStates.delete(symbol);
+}
+function ensureChartState(symbol, card) {
+  let state = chartStates.get(symbol);
+  const canvas = card.querySelector('[data-role="kline-canvas"]');
+  if (state && state.canvas === canvas) return state;
+  if (state) cleanupChartState(symbol);
+  state = {
+    symbol, card, canvas, ctx:canvas.getContext('2d'), data:[], interval:chartIntervalFor(symbol),
+    visibleCount:80, rightOffset:0, hoverIndex:null, hoverY:null, loading:false, requestId:0,
+    pointers:new Map(), dragStartX:0, dragStartOffset:0, pinchStartDistance:0, pinchStartCount:80
+  };
+  const draw = ()=>drawKlineChart(state);
+  if ('ResizeObserver' in window) {
+    state.resizeObserver = new ResizeObserver(draw);
+    state.resizeObserver.observe(canvas.parentElement);
+  } else window.addEventListener('resize', draw);
+
+  canvas.addEventListener('wheel', e=>{
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 10 : -10;
+    state.visibleCount = Math.max(20, Math.min(Math.min(180,state.data.length||180), state.visibleCount + delta));
+    state.rightOffset = Math.min(state.rightOffset, Math.max(0,(state.data.length||0)-state.visibleCount));
+    draw();
+  }, {passive:false});
+  canvas.addEventListener('pointerdown', e=>{
+    canvas.setPointerCapture?.(e.pointerId);
+    state.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if (state.pointers.size === 1) {
+      state.dragStartX=e.clientX; state.dragStartOffset=state.rightOffset;
+    } else if (state.pointers.size === 2) {
+      const pts=[...state.pointers.values()];
+      state.pinchStartDistance=Math.max(1,Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y));
+      state.pinchStartCount=state.visibleCount;
+    }
   });
-  chartHost.appendChild(script);
+  canvas.addEventListener('pointermove', e=>{
+    const rect=canvas.getBoundingClientRect();
+    state.hoverY=e.clientY-rect.top;
+    if (state.pointers.has(e.pointerId)) state.pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+    if (state.pointers.size >= 2) {
+      const pts=[...state.pointers.values()];
+      const d=Math.max(1,Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y));
+      const ratio=state.pinchStartDistance/d;
+      state.visibleCount=Math.max(20,Math.min(Math.min(180,state.data.length||180),Math.round(state.pinchStartCount*ratio)));
+      state.rightOffset=Math.min(state.rightOffset,Math.max(0,(state.data.length||0)-state.visibleCount));
+    } else if (state.pointers.size === 1 && state.data.length) {
+      const plotW=Math.max(80,rect.width-76);
+      const candleW=plotW/Math.max(1,state.visibleCount);
+      const shift=Math.round((e.clientX-state.dragStartX)/Math.max(2,candleW));
+      state.rightOffset=Math.max(0,Math.min(Math.max(0,state.data.length-state.visibleCount),state.dragStartOffset+shift));
+    }
+    updateHoverIndex(state,e.clientX-rect.left);
+    draw();
+  });
+  const endPointer=e=>{ state.pointers.delete(e.pointerId); if(!state.pointers.size){state.dragStartX=0;} };
+  canvas.addEventListener('pointerup',endPointer);
+  canvas.addEventListener('pointercancel',endPointer);
+  canvas.addEventListener('pointerleave',e=>{ if(!state.pointers.size){state.hoverIndex=null; state.hoverY=null; draw();} });
+  return state;
+}
+function visibleSlice(state) {
+  const n=state.data.length;
+  const count=Math.max(1,Math.min(state.visibleCount,n||1));
+  const end=Math.max(count, n-state.rightOffset);
+  const start=Math.max(0,end-count);
+  return {rows:state.data.slice(start,end),start,end};
+}
+function updateHoverIndex(state, x) {
+  if (!state.data.length) { state.hoverIndex=null; return; }
+  const {rows,start}=visibleSlice(state);
+  const rect=state.canvas.getBoundingClientRect();
+  const left=8, right=68, plotW=Math.max(1,rect.width-left-right);
+  if (x < left || x > left+plotW) { state.hoverIndex=null; return; }
+  const idx=Math.max(0,Math.min(rows.length-1,Math.floor((x-left)/plotW*rows.length)));
+  state.hoverIndex=start+idx;
+}
+function formatAxisPrice(n, range) {
+  if (!Number.isFinite(n)) return '';
+  const abs=Math.abs(n);
+  let digits=2;
+  if (abs<1) digits=5; else if (abs<100) digits=3; else if (range<5) digits=3;
+  return n.toLocaleString('en-US',{maximumFractionDigits:digits,minimumFractionDigits:0});
+}
+function formatChartTime(ms, interval) {
+  const d=new Date(ms);
+  if (interval==='1d') return new Intl.DateTimeFormat('zh-CN',{month:'numeric',day:'numeric'}).format(d);
+  return new Intl.DateTimeFormat('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}).format(d);
+}
+function drawKlineChart(state) {
+  const canvas=state.canvas;
+  if (!canvas || !canvas.isConnected) return;
+  const rect=canvas.getBoundingClientRect();
+  const cssW=Math.max(280,Math.floor(rect.width)), cssH=Math.max(260,Math.floor(rect.height));
+  const dpr=Math.min(2,window.devicePixelRatio||1);
+  if(canvas.width!==Math.round(cssW*dpr)||canvas.height!==Math.round(cssH*dpr)){canvas.width=Math.round(cssW*dpr);canvas.height=Math.round(cssH*dpr);}
+  const ctx=state.ctx; ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,cssW,cssH);
+  ctx.fillStyle='#0b0d12'; ctx.fillRect(0,0,cssW,cssH);
+  const left=8,right=68,top=20,bottom=30,plotW=cssW-left-right,plotH=cssH-top-bottom;
+  ctx.strokeStyle='rgba(143,151,168,.13)';ctx.lineWidth=1;
+  for(let i=0;i<=5;i++){const y=top+plotH*i/5;ctx.beginPath();ctx.moveTo(left,y+.5);ctx.lineTo(left+plotW,y+.5);ctx.stroke();}
+  for(let i=0;i<=5;i++){const x=left+plotW*i/5;ctx.beginPath();ctx.moveTo(x+.5,top);ctx.lineTo(x+.5,top+plotH);ctx.stroke();}
+  const {rows,start}=visibleSlice(state);
+  if (!rows.length) return;
+  let min=Math.min(...rows.map(k=>k.low)), max=Math.max(...rows.map(k=>k.high));
+  let range=Math.max(1e-9,max-min); const pad=range*.07; min-=pad; max+=pad; range=max-min;
+  const yOf=p=>top+(max-p)/range*plotH;
+  ctx.font='11px -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif';ctx.textAlign='left';ctx.textBaseline='middle';ctx.fillStyle='#8f97a8';
+  for(let i=0;i<=5;i++){const p=max-range*i/5;const y=top+plotH*i/5;ctx.fillText(formatAxisPrice(p,range),left+plotW+7,y);}
+  const step=plotW/rows.length, bodyW=Math.max(1,Math.min(12,step*.68));
+  rows.forEach((k,i)=>{
+    const x=left+step*(i+.5), yo=yOf(k.open), yc=yOf(k.close), yh=yOf(k.high), yl=yOf(k.low);
+    const up=k.close>=k.open, color=up?'#34c759':'#ff453a';ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(x,yh);ctx.lineTo(x,yl);ctx.stroke();
+    const y=Math.min(yo,yc), h=Math.max(1,Math.abs(yc-yo));ctx.fillRect(x-bodyW/2,y,bodyW,h);
+  });
+  ctx.textAlign='center';ctx.textBaseline='top';ctx.fillStyle='#8f97a8';
+  const marks=[0,.25,.5,.75,1];
+  marks.forEach(frac=>{const i=Math.min(rows.length-1,Math.round((rows.length-1)*frac));const x=left+step*(i+.5);ctx.fillText(formatChartTime(rows[i].time,state.interval),x,top+plotH+8);});
+  if (state.hoverIndex!=null && state.hoverIndex>=start && state.hoverIndex<start+rows.length) {
+    const local=state.hoverIndex-start,k=state.data[state.hoverIndex],x=left+step*(local+.5);const y=Math.max(top,Math.min(top+plotH,state.hoverY??yOf(k.close)));
+    ctx.strokeStyle='rgba(244,246,251,.42)';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,top+plotH);ctx.moveTo(left,y);ctx.lineTo(left+plotW,y);ctx.stroke();ctx.setLineDash([]);
+    const hover=state.card.querySelector('[data-role="chart-ohlc"]');
+    if(hover) hover.textContent=`${formatChartTime(k.time,state.interval)}  O ${formatPrice(k.open)}  H ${formatPrice(k.high)}  L ${formatPrice(k.low)}  C ${formatPrice(k.close)}`;
+  } else {
+    const last=rows[rows.length-1]; const hover=state.card.querySelector('[data-role="chart-ohlc"]');
+    if(hover) hover.textContent=`O ${formatPrice(last.open)}  H ${formatPrice(last.high)}  L ${formatPrice(last.low)}  C ${formatPrice(last.close)}`;
+  }
+}
+async function loadKlineChart(symbol, card, {resetView=false,force=false}={}) {
+  const state=ensureChartState(symbol,card); const interval=chartIntervalFor(symbol);
+  if(!force && state.interval===interval && state.data.length){drawKlineChart(state);return;}
+  state.interval=interval; state.loading=true; const requestId=++state.requestId;
+  const status=card.querySelector('[data-role="chart-status"]'); if(status){status.textContent=`正在加载 ${CHART_INTERVAL_LABELS[interval]} K线…`;status.className='chart-status loading';}
+  try {
+    const rows=await fetchChartKlines(symbol,interval,CHART_LIMIT); if(requestId!==state.requestId)return;
+    state.data=rows; if(resetView||!state.visibleCount)state.visibleCount=Math.min(80,rows.length); else state.visibleCount=Math.max(20,Math.min(state.visibleCount,rows.length)); state.rightOffset=Math.min(state.rightOffset,Math.max(0,rows.length-state.visibleCount));
+    if(status){status.textContent=`${CHART_INTERVAL_LABELS[interval]} · ${rows.length} 根 · 拖动平移 / 双指或滚轮缩放`;status.className='chart-status';}
+    drawKlineChart(state);
+  } catch(e) {
+    console.warn('Kline load failed',symbol,interval,e);
+    if(status){status.textContent='K线加载失败。开 VPN 可直连；若想无 VPN 使用，请同时更新 v13 后端。';status.className='chart-status error';}
+    drawKlineChart(state);
+  } finally {if(requestId===state.requestId)state.loading=false;}
+}
+function updateOpenChartLive(symbol) {
+  const state=chartStates.get(symbol); const price=Number(prices[symbol]?.price);
+  if(!state||!expandedCharts.has(symbol)||!state.data.length||!Number.isFinite(price))return;
+  const bucket=Math.floor(Date.now()/intervalMs(state.interval))*intervalMs(state.interval),last=state.data[state.data.length-1];
+  if(last.time===bucket){last.close=price;last.high=Math.max(last.high,price);last.low=Math.min(last.low,price);drawKlineChart(state);}
+}
+function scheduleChartRefresh() {
+  clearInterval(chartRefreshTimer);
+  chartRefreshTimer=setInterval(()=>{
+    if(document.visibilityState==='hidden')return;
+    for(const symbol of expandedCharts){const card=el.priceList.querySelector(`[data-price-card-symbol="${CSS.escape(symbol)}"]`);if(card)loadKlineChart(symbol,card,{force:true}).catch(()=>{});}
+  },30000);
 }
 function createPriceCard(symbol) {
   const card = document.createElement('article');
   card.className = 'price-card';
   card.dataset.priceCardSymbol = symbol;
-  card.innerHTML = `<div class="price-main"><div><div class="symbol" data-role="symbol"></div><div class="pair-sub" data-role="market"></div></div><div><div class="price-value" data-role="price">—</div><div class="change" data-role="change">等待行情…</div></div></div><div class="row-actions price-actions"><button class="ghost chart-toggle" data-action="toggle-chart" data-symbol="${symbol}">展开图表</button><button class="ghost" data-action="quick-alert" data-symbol="${symbol}">设提醒</button><button class="danger compact-danger" data-action="remove-symbol" data-symbol="${symbol}">移除</button></div><div class="chart-wrap" data-role="chart-wrap" hidden><div class="tradingview-widget-container tv-chart" data-role="tv-chart" aria-label="${symbol} TradingView 图表"></div><p class="chart-note">图表由 TradingView 提供。可独立切换周期、指标和画线工具。</p></div>`;
+  card.innerHTML = `<div class="price-main"><div><div class="symbol" data-role="symbol"></div><div class="pair-sub" data-role="market"></div></div><div><div class="price-value" data-role="price">—</div><div class="change" data-role="change">等待行情…</div></div></div><div class="row-actions price-actions"><button class="ghost chart-toggle" data-action="toggle-chart" data-symbol="${symbol}">展开图表</button><button class="ghost" data-action="quick-alert" data-symbol="${symbol}">设提醒</button><button class="danger compact-danger" data-action="remove-symbol" data-symbol="${symbol}">移除</button></div><div class="chart-wrap" data-role="chart-wrap" hidden><div class="chart-toolbar"><div class="chart-intervals">${chartButtonsHtml(symbol)}</div><div class="chart-tools"><button type="button" class="chart-tool" data-action="chart-zoom-in" data-symbol="${symbol}" aria-label="放大">＋</button><button type="button" class="chart-tool" data-action="chart-zoom-out" data-symbol="${symbol}" aria-label="缩小">－</button><button type="button" class="chart-tool reset" data-action="chart-reset" data-symbol="${symbol}">最新</button></div></div><div class="kline-shell"><canvas class="kline-canvas" data-role="kline-canvas" aria-label="${symbol} K线图"></canvas><div class="chart-ohlc" data-role="chart-ohlc"></div></div><div class="chart-status" data-role="chart-status">展开后加载 K 线</div></div>`;
   return card;
 }
 function updatePriceCard(card, symbol) {
@@ -244,15 +440,11 @@ function updatePriceCard(card, symbol) {
   card.querySelector('[data-role="market"]').textContent = marketLabel(symbol);
   card.querySelector('[data-role="price"]').textContent = data ? '$'+formatPrice(data.price) : '—';
   const changeEl = card.querySelector('[data-role="change"]');
-  changeEl.className = `change ${changeClass}`.trim();
-  changeEl.textContent = changeText;
-  const wrap = card.querySelector('[data-role="chart-wrap"]');
-  const btn = card.querySelector('[data-action="toggle-chart"]');
-  const open = expandedCharts.has(symbol);
-  wrap.hidden = !open;
-  btn.textContent = open ? '收起图表' : '展开图表';
-  btn.setAttribute('aria-expanded', String(open));
-  if (open) mountTradingViewChart(symbol, card.querySelector('[data-role="tv-chart"]'));
+  changeEl.className = `change ${changeClass}`.trim(); changeEl.textContent = changeText;
+  const wrap = card.querySelector('[data-role="chart-wrap"]'), btn = card.querySelector('[data-action="toggle-chart"]'), open = expandedCharts.has(symbol);
+  wrap.hidden = !open; btn.textContent = open ? '收起图表' : '展开图表'; btn.setAttribute('aria-expanded', String(open));
+  const interval=chartIntervalFor(symbol); card.querySelectorAll('[data-action="chart-interval"]').forEach(b=>b.classList.toggle('active',b.dataset.interval===interval));
+  if (open) { loadKlineChart(symbol,card).catch(()=>{}); updateOpenChartLive(symbol); }
 }
 function renderPrices() {
   if (!symbols.length) {
@@ -262,7 +454,7 @@ function renderPrices() {
   }
   el.priceList.querySelector('.empty')?.remove();
   for (const card of [...el.priceList.querySelectorAll('[data-price-card-symbol]')]) {
-    if (!symbols.includes(card.dataset.priceCardSymbol)) card.remove();
+    if (!symbols.includes(card.dataset.priceCardSymbol)) { cleanupChartState(card.dataset.priceCardSymbol); card.remove(); }
   }
   for (const symbol of symbols) {
     let card = el.priceList.querySelector(`[data-price-card-symbol="${CSS.escape(symbol)}"]`);
@@ -786,6 +978,20 @@ el.priceList.addEventListener('click',event=>{
     if(card) updatePriceCard(card,symbol);
     return;
   }
+  if(btn.dataset.action==='chart-interval'){
+    const interval=btn.dataset.interval;
+    if(!CHART_INTERVALS.includes(interval))return;
+    chartIntervals[symbol]=interval; saveChartIntervals();
+    const card=btn.closest('[data-price-card-symbol]');
+    if(card){card.querySelectorAll('[data-action="chart-interval"]').forEach(b=>b.classList.toggle('active',b.dataset.interval===interval));loadKlineChart(symbol,card,{resetView:true,force:true}).catch(()=>{});}
+    return;
+  }
+  if(btn.dataset.action==='chart-zoom-in'||btn.dataset.action==='chart-zoom-out'||btn.dataset.action==='chart-reset'){
+    const card=btn.closest('[data-price-card-symbol]'),state=chartStates.get(symbol)|| (card?ensureChartState(symbol,card):null); if(!state)return;
+    if(btn.dataset.action==='chart-reset'){state.visibleCount=Math.min(80,state.data.length||80);state.rightOffset=0;}
+    else {const delta=btn.dataset.action==='chart-zoom-in'?-12:12;state.visibleCount=Math.max(20,Math.min(Math.min(180,state.data.length||180),state.visibleCount+delta));state.rightOffset=Math.min(state.rightOffset,Math.max(0,(state.data.length||0)-state.visibleCount));}
+    drawKlineChart(state); return;
+  }
   if(btn.dataset.action==='remove-symbol'){
     const symbolIndex=symbols.indexOf(symbol);
     const removedMarket=markets[symbol];
@@ -797,6 +1003,7 @@ el.priceList.addEventListener('click',event=>{
     delete prices[symbol];
     delete markets[symbol];
     expandedCharts.delete(symbol);
+    cleanupChartState(symbol);
     saveExpandedCharts();
     saveState();
     renderPrices(); renderAlerts(); renderAlertSymbolOptions(); connectSocket();
@@ -855,4 +1062,4 @@ window.addEventListener('online',()=>{connectSocket();refreshBackendStatus();});
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){const cfg=backendConfig();const active=Object.values(sockets).some(ws=>ws&&ws.readyState===1);if((cfg.url&&cfg.token)||!active)connectSocket();refreshBackendStatus();}else{stopBackendQuotePolling();}});
 if('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').then(()=>refreshBackendStatus()).catch(console.warn));
 
-renderPrices(); renderAlerts(); renderAlertSymbolOptions(); updateNotificationUI(); connectSocket(); getClientId();
+renderPrices(); renderAlerts(); renderAlertSymbolOptions(); updateNotificationUI(); connectSocket(); getClientId(); scheduleChartRefresh();
