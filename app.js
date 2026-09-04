@@ -5,7 +5,8 @@ const STORAGE = {
   backendUrl: 'pricewatch_backend_url_v2',
   backendToken: 'pricewatch_backend_token_v2',
   clientId: 'pricewatch_client_id_v2',
-  markets: 'pricewatch_markets_v3'
+  markets: 'pricewatch_markets_v3',
+  expandedCharts: 'pricewatch_expanded_charts_v1'
 };
 
 const VAPID_PUBLIC_KEY = 'BDOPB7t_5ss8hWCqrcCZO-fj3CM87At5ytLrA-dcek75GptW7kg-ZD3XC2i9vMHeMN2f3jQ_0FC2bMajAG-NzrE';
@@ -28,6 +29,7 @@ let futuresRestTimer = null;
 let futuresRestBusy = false;
 let undoTimer = null;
 let undoAction = null;
+let expandedCharts = new Set(loadJSON(STORAGE.expandedCharts, []));
 
 const el = {
   priceList: document.querySelector('#priceList'), alertList: document.querySelector('#alertList'),
@@ -181,22 +183,93 @@ function migrateLegacySymbols() {
   localStorage.setItem(STORAGE.markets, JSON.stringify(markets));
 }
 migrateLegacySymbols();
+expandedCharts = new Set([...expandedCharts].filter(symbol => symbols.includes(symbol)));
+saveExpandedCharts();
 function formatPrice(n) {
   const value = Number(n); if (!Number.isFinite(value)) return '—';
   const digits = value >= 1000 ? 2 : value >= 1 ? 4 : value >= 0.01 ? 5 : 8;
   return value.toLocaleString('en-US', { maximumFractionDigits: digits, minimumFractionDigits: value >= 1000 ? 2 : 0 });
 }
-function renderPrices() {
-  el.priceList.innerHTML = '';
-  if (!symbols.length) { el.priceList.innerHTML = '<div class="empty">还没有监控币种，点右上角添加。</div>'; return; }
-  symbols.forEach(symbol => {
-    const data = prices[symbol], change = data?.changePct ?? null;
-    const card = document.createElement('div'); card.className = 'price-card';
-    const changeClass = change > 0 ? 'up' : change < 0 ? 'down' : '';
-    const changeText = change == null ? '等待行情…' : `${change > 0 ? '+' : ''}${change.toFixed(2)}% · 24h`;
-    card.innerHTML = `<div class="price-main"><div><div class="symbol">${symbol}</div><div class="pair-sub">${marketLabel(symbol)}</div></div><div><div class="price-value">${data ? '$'+formatPrice(data.price) : '—'}</div><div class="change ${changeClass}">${changeText}</div></div></div><div class="row-actions"><button class="ghost" data-action="quick-alert" data-symbol="${symbol}">设提醒</button><button class="danger compact-danger" data-action="remove-symbol" data-symbol="${symbol}">移除</button></div>`;
-    el.priceList.appendChild(card);
+function saveExpandedCharts() {
+  localStorage.setItem(STORAGE.expandedCharts, JSON.stringify([...expandedCharts]));
+}
+function tradingViewSymbol(symbol) {
+  const market = markets[symbol] || (KNOWN_FUTURES_SYMBOLS.has(symbol) ? 'futures' : 'spot');
+  return `BINANCE:${symbol}${market === 'futures' ? '.P' : ''}`;
+}
+function mountTradingViewChart(symbol, chartHost) {
+  if (!chartHost) return;
+  const tvSymbol = tradingViewSymbol(symbol);
+  if (chartHost.dataset.mountedSymbol === tvSymbol && chartHost.childElementCount) return;
+  chartHost.dataset.mountedSymbol = tvSymbol;
+  chartHost.innerHTML = '<div class="tradingview-widget-container__widget"></div>';
+  const script = document.createElement('script');
+  script.type = 'text/javascript';
+  script.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
+  script.async = true;
+  script.textContent = JSON.stringify({
+    autosize: true,
+    symbol: tvSymbol,
+    interval: '15',
+    timezone: 'Asia/Shanghai',
+    theme: 'dark',
+    style: '1',
+    locale: 'zh_CN',
+    backgroundColor: '#0b0d12',
+    gridColor: 'rgba(255,255,255,0.05)',
+    hide_side_toolbar: false,
+    hide_top_toolbar: false,
+    hide_legend: false,
+    hide_volume: true,
+    allow_symbol_change: true,
+    withdateranges: true,
+    save_image: false,
+    calendar: false,
+    support_host: 'https://www.tradingview.com'
   });
+  chartHost.appendChild(script);
+}
+function createPriceCard(symbol) {
+  const card = document.createElement('article');
+  card.className = 'price-card';
+  card.dataset.priceCardSymbol = symbol;
+  card.innerHTML = `<div class="price-main"><div><div class="symbol" data-role="symbol"></div><div class="pair-sub" data-role="market"></div></div><div><div class="price-value" data-role="price">—</div><div class="change" data-role="change">等待行情…</div></div></div><div class="row-actions price-actions"><button class="ghost chart-toggle" data-action="toggle-chart" data-symbol="${symbol}">展开图表</button><button class="ghost" data-action="quick-alert" data-symbol="${symbol}">设提醒</button><button class="danger compact-danger" data-action="remove-symbol" data-symbol="${symbol}">移除</button></div><div class="chart-wrap" data-role="chart-wrap" hidden><div class="tradingview-widget-container tv-chart" data-role="tv-chart" aria-label="${symbol} TradingView 图表"></div><p class="chart-note">图表由 TradingView 提供。可独立切换周期、指标和画线工具。</p></div>`;
+  return card;
+}
+function updatePriceCard(card, symbol) {
+  const data = prices[symbol], change = data?.changePct ?? null;
+  const changeClass = change > 0 ? 'up' : change < 0 ? 'down' : '';
+  const changeText = change == null ? '等待行情…' : `${change > 0 ? '+' : ''}${change.toFixed(2)}% · 24h`;
+  card.querySelector('[data-role="symbol"]').textContent = symbol;
+  card.querySelector('[data-role="market"]').textContent = marketLabel(symbol);
+  card.querySelector('[data-role="price"]').textContent = data ? '$'+formatPrice(data.price) : '—';
+  const changeEl = card.querySelector('[data-role="change"]');
+  changeEl.className = `change ${changeClass}`.trim();
+  changeEl.textContent = changeText;
+  const wrap = card.querySelector('[data-role="chart-wrap"]');
+  const btn = card.querySelector('[data-action="toggle-chart"]');
+  const open = expandedCharts.has(symbol);
+  wrap.hidden = !open;
+  btn.textContent = open ? '收起图表' : '展开图表';
+  btn.setAttribute('aria-expanded', String(open));
+  if (open) mountTradingViewChart(symbol, card.querySelector('[data-role="tv-chart"]'));
+}
+function renderPrices() {
+  if (!symbols.length) {
+    expandedCharts.clear(); saveExpandedCharts();
+    el.priceList.innerHTML = '<div class="empty">还没有监控币种，点右上角添加。</div>';
+    return;
+  }
+  el.priceList.querySelector('.empty')?.remove();
+  for (const card of [...el.priceList.querySelectorAll('[data-price-card-symbol]')]) {
+    if (!symbols.includes(card.dataset.priceCardSymbol)) card.remove();
+  }
+  for (const symbol of symbols) {
+    let card = el.priceList.querySelector(`[data-price-card-symbol="${CSS.escape(symbol)}"]`);
+    if (!card) card = createPriceCard(symbol);
+    updatePriceCard(card, symbol);
+    el.priceList.appendChild(card);
+  }
 }
 function renderAlerts() {
   el.alertList.innerHTML = '';
@@ -706,21 +779,32 @@ el.priceList.addEventListener('click',event=>{
   const btn=event.target.closest('button');
   if(!btn)return;
   const symbol=btn.dataset.symbol;
+  if(btn.dataset.action==='toggle-chart'){
+    if(expandedCharts.has(symbol)) expandedCharts.delete(symbol); else expandedCharts.add(symbol);
+    saveExpandedCharts();
+    const card=btn.closest('[data-price-card-symbol]');
+    if(card) updatePriceCard(card,symbol);
+    return;
+  }
   if(btn.dataset.action==='remove-symbol'){
     const symbolIndex=symbols.indexOf(symbol);
     const removedMarket=markets[symbol];
     const removedPrice=prices[symbol];
+    const removedChartOpen=expandedCharts.has(symbol);
     const removedAlerts=alerts.map((a,index)=>({a,index})).filter(x=>x.a.symbol===symbol);
     symbols=symbols.filter(s=>s!==symbol);
     alerts=alerts.filter(a=>a.symbol!==symbol);
     delete prices[symbol];
     delete markets[symbol];
+    expandedCharts.delete(symbol);
+    saveExpandedCharts();
     saveState();
     renderPrices(); renderAlerts(); renderAlertSymbolOptions(); connectSocket();
     offerUndo(`已移除 ${symbol}`, ()=>{
       if(!symbols.includes(symbol)) symbols.splice(Math.max(0, symbolIndex),0,symbol);
       if(removedMarket) markets[symbol]=removedMarket;
       if(removedPrice) prices[symbol]=removedPrice;
+      if(removedChartOpen) { expandedCharts.add(symbol); saveExpandedCharts(); }
       removedAlerts.sort((x,y)=>x.index-y.index).forEach(({a,index})=>{
         if(!alerts.some(existing=>existing.id===a.id)) alerts.splice(Math.min(index,alerts.length),0,a);
       });

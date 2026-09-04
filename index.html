@@ -16,7 +16,7 @@
   <main class="app-shell">
     <header class="topbar">
       <div>
-        <p class="eyebrow">BINANCE SPOT</p>
+        <p class="eyebrow">BINANCE MARKET</p>
         <h1>Price Watch</h1>
       </div>
       <div class="status-pill" id="connectionStatus"><span class="dot"></span><span>连接中</span></div>
@@ -55,7 +55,7 @@
       <div class="settings-row">
         <div>
           <strong>后台锁屏提醒</strong>
-          <span id="backendHint">未配置</span>
+          <span id="backendHint" class="backend-warn">未配置</span>
         </div>
         <button class="ghost" id="backendBtn" type="button">设置后台</button>
       </div>
@@ -78,54 +78,35 @@
       </div>
     </section>
 
-    <p class="footnote">前台自动识别 Binance Spot / USDⓈ-M Futures 并使用对应 WebSocket 实时监控。后台连接成功后，由 Cloudflare 大约每 1 分钟检查一次价格。两边共用同一组提醒，已触发提醒会同步为关闭状态。</p>
+    <p class="footnote">前台自动识别 Binance Spot / USDⓈ-M Futures 并使用对应 WebSocket 实时监控。每个品种可独立展开 TradingView 图表，同时展开多个时会自动组成多图布局。后台连接成功后，由 Cloudflare 大约每 1 分钟检查一次提醒。</p>
   </main>
 
   <dialog id="symbolDialog">
     <form method="dialog" id="symbolForm" class="dialog-card">
-      <div class="dialog-title">
-        <div><p class="eyebrow">WATCHLIST</p><h3>添加交易对</h3></div>
-        <button class="icon-btn" value="cancel" aria-label="关闭" type="submit">×</button>
-      </div>
-      <label>币种或交易对
-        <input id="symbolInput" autocomplete="off" placeholder="例如 ETH、ETHUSDT、ETH/USDT" />
-      </label>
+      <div class="dialog-title"><div><p class="eyebrow">WATCHLIST</p><h3>添加交易对</h3></div><button class="icon-btn" value="cancel" aria-label="关闭" type="submit">×</button></div>
+      <label>币种或交易对<input id="symbolInput" autocomplete="off" placeholder="例如 ETH、ETHUSDT、ETH/USDT" /></label>
       <p class="help">只输入 ETH 时会自动转换为 ETHUSDT，并自动识别 Binance Spot 或 USDⓈ-M Futures。</p>
-      <button class="primary full" value="default" type="submit">添加</button>
+      <button class="primary full" id="confirmSymbolBtn" value="default" type="submit">添加</button>
     </form>
   </dialog>
 
   <dialog id="alertDialog">
     <form method="dialog" id="alertForm" class="dialog-card">
-      <div class="dialog-title">
-        <div><p class="eyebrow">PRICE ALERT</p><h3>添加提醒</h3></div>
-        <button class="icon-btn" value="cancel" aria-label="关闭" type="submit">×</button>
-      </div>
+      <div class="dialog-title"><div><p class="eyebrow">PRICE ALERT</p><h3>添加提醒</h3></div><button class="icon-btn" value="cancel" aria-label="关闭" type="submit">×</button></div>
       <label>交易对<select id="alertSymbol"></select></label>
-      <label>条件
-        <select id="alertDirection"><option value="above">价格 ≥</option><option value="below">价格 ≤</option></select>
-      </label>
-      <label>目标价格
-        <input id="alertPrice" inputmode="decimal" type="number" min="0" step="any" placeholder="例如 5000" />
-      </label>
-      <button class="primary full" value="default" type="submit">保存提醒</button>
+      <label>条件<select id="alertDirection"><option value="above">价格 ≥</option><option value="below">价格 ≤</option></select></label>
+      <label>目标价格<input id="alertPrice" inputmode="decimal" type="number" min="0" step="any" placeholder="例如 5000" /></label>
+      <button class="primary full" id="confirmAlertBtn" value="default" type="submit">保存提醒</button>
     </form>
   </dialog>
 
   <dialog id="backendDialog">
     <form method="dialog" id="backendForm" class="dialog-card">
-      <div class="dialog-title">
-        <div><p class="eyebrow">BACKGROUND PUSH</p><h3>连接后台提醒</h3></div>
-        <button class="icon-btn" value="cancel" aria-label="关闭" type="submit">×</button>
-      </div>
-      <label>Worker 地址
-        <input id="backendUrlInput" inputmode="url" autocomplete="off" placeholder="https://price-watch-backend.xxx.workers.dev" />
-      </label>
-      <label>后台密钥
-        <input id="backendTokenInput" type="password" autocomplete="off" placeholder="ADMIN_TOKEN" />
-      </label>
+      <div class="dialog-title"><div><p class="eyebrow">BACKGROUND PUSH</p><h3>连接后台提醒</h3></div><button class="icon-btn" value="cancel" aria-label="关闭" type="submit">×</button></div>
+      <label>Worker 地址<input id="backendUrlInput" autocomplete="url" inputmode="url" placeholder="https://price-watch-backend.xxx.workers.dev" /></label>
+      <label>后台密钥<input id="backendTokenInput" autocomplete="off" type="password" placeholder="ADMIN_TOKEN" /></label>
       <p class="help">这两个值只保存在本机。连接时会申请 Web Push 订阅，并把你的提醒同步到 Cloudflare。</p>
-      <button class="primary full" value="connect" type="submit">连接并开启后台提醒</button>
+      <button class="primary full" id="confirmBackendBtn" value="default" type="submit">连接并开启后台提醒</button>
     </form>
   </dialog>
 
