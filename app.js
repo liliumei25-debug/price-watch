@@ -200,8 +200,8 @@ function saveExpandedCharts() {
 const CHART_INTERVALS = ['5m','15m','30m','1h','2h','4h','1d'];
 const CHART_INTERVAL_LABELS = {'5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','1d':'1D'};
 const CHART_LIMIT = 260;
-const LIVE_CHART_DRAW_MS = 700;
-const CHART_REFRESH_MS = 120000;
+const LIVE_CHART_DRAW_MS = 300000;
+const CHART_REFRESH_MS = 300000;
 
 function chartIntervalFor(symbol) {
   const saved = chartIntervals?.[symbol];
@@ -442,7 +442,7 @@ async function loadKlineChart(symbol, card, {resetView=false,force=false}={}) {
   try {
     const rows=await fetchChartKlines(symbol,interval,CHART_LIMIT); if(requestId!==state.requestId)return;
     state.data=rows; if(resetView||!state.visibleCount)state.visibleCount=Math.min(80,rows.length); else state.visibleCount=Math.max(20,Math.min(state.visibleCount,rows.length)); state.rightOffset=Math.min(state.rightOffset,Math.max(0,rows.length-state.visibleCount));
-    if(status){status.textContent=`${CHART_INTERVAL_LABELS[interval]} · ${rows.length} 根 · 拖动平移 / 双指或滚轮缩放`;status.className='chart-status';}
+    if(status){status.textContent=`${CHART_INTERVAL_LABELS[interval]} · ${rows.length} 根 · 图表每 5 分钟自动刷新 · 拖动平移 / 双指或滚轮缩放`;status.className='chart-status';}
     drawKlineChart(state);
   } catch(e) {
     console.warn('Kline load failed',symbol,interval,e);
@@ -475,12 +475,12 @@ function updateOpenChartLive(symbol) {
   const bucket=Math.floor(Date.now()/intervalMs(state.interval))*intervalMs(state.interval),last=state.data[state.data.length-1];
   if(last.time===bucket){
     last.close=price;last.high=Math.max(last.high,price);last.low=Math.min(last.low,price);
-    scheduleChartDraw(state);
+    // 行情数字实时更新，但后台价格跳动不触发画布重绘，避免 iPad Safari 频繁闪烁。
   } else if (bucket > last.time) {
     state.data.push({time:bucket,open:last.close,high:price,low:price,close:price});
     if (state.data.length > CHART_LIMIT) state.data.shift();
     state.rightOffset = 0;
-    scheduleChartDraw(state);
+    // 新 K 线先写入内存，等 5 分钟定时刷新或用户主动操作时再绘制。
   }
 }
 function scheduleChartRefresh() {
@@ -523,7 +523,7 @@ function updatePriceCard(card, symbol) {
 function updateSinglePriceCard(symbol) {
   const card = el.priceList.querySelector(`[data-price-card-symbol="${CSS.escape(symbol)}"]`);
   if (!card) { renderPrices(); return; }
-  // 实时行情只更新数字与最后一根 K 线，不再反复触碰图表布局和周期按钮。
+  // 实时行情只更新价格数字；K 线数据在内存同步，画布按 5 分钟节奏刷新。
   updatePriceValues(card,symbol);
   updateOpenChartLive(symbol);
 }
