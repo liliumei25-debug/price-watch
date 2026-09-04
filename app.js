@@ -276,7 +276,7 @@ function ensureChartState(symbol, card) {
   if (state) cleanupChartState(symbol);
   state = {
     symbol, card, canvas, ctx:canvas.getContext('2d'), data:[], interval:chartIntervalFor(symbol),
-    visibleCount:80, rightOffset:0, hoverIndex:null, hoverY:null, loading:false, requestId:0,
+    visibleCount:80, rightOffset:0, hoverIndex:null, hoverY:null, loading:false, requestId:0, drawPending:false,
     pointers:new Map(), dragStartX:0, dragStartOffset:0, pinchStartDistance:0, pinchStartCount:80
   };
   const draw = ()=>drawKlineChart(state);
@@ -398,9 +398,12 @@ function drawKlineChart(state) {
 }
 async function loadKlineChart(symbol, card, {resetView=false,force=false}={}) {
   const state=ensureChartState(symbol,card); const interval=chartIntervalFor(symbol);
-  if(!force && state.interval===interval && state.data.length){drawKlineChart(state);return;}
+  if(!force && state.interval===interval && state.data.length)return;
+  if(force && state.loading && state.interval===interval)return;
+  const hadData=state.data.length>0;
   state.interval=interval; state.loading=true; const requestId=++state.requestId;
-  const status=card.querySelector('[data-role="chart-status"]'); if(status){status.textContent=`正在加载 ${CHART_INTERVAL_LABELS[interval]} K线…`;status.className='chart-status loading';}
+  const status=card.querySelector('[data-role="chart-status"]');
+  if(status && (!hadData || resetView)){status.textContent=`正在加载 ${CHART_INTERVAL_LABELS[interval]} K线…`;status.className='chart-status loading';}
   try {
     const rows=await fetchChartKlines(symbol,interval,CHART_LIMIT); if(requestId!==state.requestId)return;
     state.data=rows; if(resetView||!state.visibleCount)state.visibleCount=Math.min(80,rows.length); else state.visibleCount=Math.max(20,Math.min(state.visibleCount,rows.length)); state.rightOffset=Math.min(state.rightOffset,Math.max(0,rows.length-state.visibleCount));
@@ -412,11 +415,27 @@ async function loadKlineChart(symbol, card, {resetView=false,force=false}={}) {
     drawKlineChart(state);
   } finally {if(requestId===state.requestId)state.loading=false;}
 }
+function scheduleChartDraw(state) {
+  if (!state || state.drawPending) return;
+  state.drawPending = true;
+  requestAnimationFrame(() => {
+    state.drawPending = false;
+    drawKlineChart(state);
+  });
+}
 function updateOpenChartLive(symbol) {
   const state=chartStates.get(symbol); const price=Number(prices[symbol]?.price);
   if(!state||!expandedCharts.has(symbol)||!state.data.length||!Number.isFinite(price))return;
   const bucket=Math.floor(Date.now()/intervalMs(state.interval))*intervalMs(state.interval),last=state.data[state.data.length-1];
-  if(last.time===bucket){last.close=price;last.high=Math.max(last.high,price);last.low=Math.min(last.low,price);drawKlineChart(state);}
+  if(last.time===bucket){
+    last.close=price;last.high=Math.max(last.high,price);last.low=Math.min(last.low,price);
+    scheduleChartDraw(state);
+  } else if (bucket > last.time) {
+    state.data.push({time:bucket,open:last.close,high:price,low:price,close:price});
+    if (state.data.length > CHART_LIMIT) state.data.shift();
+    state.rightOffset = 0;
+    scheduleChartDraw(state);
+  }
 }
 function scheduleChartRefresh() {
   clearInterval(chartRefreshTimer);
@@ -442,9 +461,20 @@ function updatePriceCard(card, symbol) {
   const changeEl = card.querySelector('[data-role="change"]');
   changeEl.className = `change ${changeClass}`.trim(); changeEl.textContent = changeText;
   const wrap = card.querySelector('[data-role="chart-wrap"]'), btn = card.querySelector('[data-action="toggle-chart"]'), open = expandedCharts.has(symbol);
+  const wasHidden = wrap.hidden;
   wrap.hidden = !open; btn.textContent = open ? '收起图表' : '展开图表'; btn.setAttribute('aria-expanded', String(open));
   const interval=chartIntervalFor(symbol); card.querySelectorAll('[data-action="chart-interval"]').forEach(b=>b.classList.toggle('active',b.dataset.interval===interval));
-  if (open) { loadKlineChart(symbol,card).catch(()=>{}); updateOpenChartLive(symbol); }
+  if (open) {
+    const state=chartStates.get(symbol);
+    if (!state || !state.data.length || state.interval!==interval) loadKlineChart(symbol,card).catch(()=>{});
+    else if (wasHidden) scheduleChartDraw(state);
+    updateOpenChartLive(symbol);
+  }
+}
+function updateSinglePriceCard(symbol) {
+  const card = el.priceList.querySelector(`[data-price-card-symbol="${CSS.escape(symbol)}"]`);
+  if (!card) { renderPrices(); return; }
+  updatePriceCard(card, symbol);
 }
 function renderPrices() {
   if (!symbols.length) {
@@ -456,12 +486,16 @@ function renderPrices() {
   for (const card of [...el.priceList.querySelectorAll('[data-price-card-symbol]')]) {
     if (!symbols.includes(card.dataset.priceCardSymbol)) { cleanupChartState(card.dataset.priceCardSymbol); card.remove(); }
   }
-  for (const symbol of symbols) {
+  symbols.forEach((symbol,index) => {
     let card = el.priceList.querySelector(`[data-price-card-symbol="${CSS.escape(symbol)}"]`);
-    if (!card) card = createPriceCard(symbol);
+    if (!card) {
+      card = createPriceCard(symbol);
+      const cards = [...el.priceList.querySelectorAll('[data-price-card-symbol]')];
+      const target = cards[index] || null;
+      if (target) el.priceList.insertBefore(card,target); else el.priceList.appendChild(card);
+    }
     updatePriceCard(card, symbol);
-    el.priceList.appendChild(card);
-  }
+  });
 }
 function renderAlerts() {
   el.alertList.innerHTML = '';
@@ -497,7 +531,7 @@ function handleTicker(data, market) {
   const price = Number(data.c), open = Number(data.o);
   if (!Number.isFinite(price)) return;
   prices[symbol] = { price, open, high:Number(data.h), low:Number(data.l), changePct:open ? ((price-open)/open)*100 : 0, updatedAt:Date.now(), market };
-  renderPrices(); renderAlerts(); checkAlerts(symbol, price);
+  updateSinglePriceCard(symbol); renderAlerts(); checkAlerts(symbol, price);
 }
 function openMarketSocket(market, marketSymbols, candidateIndex=0) {
   if (!marketSymbols.length) return;
@@ -565,7 +599,7 @@ function handleTradFiKline(data) {
     changePct: Number.isFinite(Number(prev.changePct)) ? Number(prev.changePct) : 0,
     updatedAt: Date.now(), market: 'futures'
   };
-  renderPrices(); renderAlerts(); checkAlerts(symbol, price);
+  updateSinglePriceCard(symbol); renderAlerts(); checkAlerts(symbol, price);
 }
 function openTradFiSocket(tradfiSymbols, candidateIndex=0) {
   if (!tradfiSymbols.length) return;
@@ -653,7 +687,11 @@ function openTradFiStatsSocket(tradfiSymbols) {
           got = true;
           changed = true;
         }
-        if (changed) { clearTimeout(fallbackTimer); renderPrices(); renderAlerts(); }
+        if (changed) {
+          clearTimeout(fallbackTimer);
+          for (const symbol of tradfiSymbols) updateSinglePriceCard(symbol);
+          renderAlerts();
+        }
       } catch (e) { console.warn('TradFi 24h ticker parse error', e); }
     };
     ws.onerror = () => {};
@@ -681,6 +719,7 @@ async function pollFuturesRestFallback() {
   if (!list.length) { scheduleFuturesRestFallback(3000); return; }
   futuresRestBusy = true;
   try {
+    const touched = [];
     for (const symbol of list) {
       try {
         const controller = new AbortController();
@@ -698,10 +737,12 @@ async function pollFuturesRestFallback() {
         const price=Number(d?.lastPrice), open=Number(d?.openPrice);
         if (!Number.isFinite(price)) continue;
         prices[symbol]={price,open,high:Number(d.highPrice),low:Number(d.lowPrice),changePct:Number(d.priceChangePercent)||0,updatedAt:Date.now(),market:'futures'};
+        touched.push(symbol);
         checkAlerts(symbol,price);
       } catch (e) { console.warn('Futures REST fallback failed',symbol,e); }
     }
-    renderPrices(); renderAlerts();
+    for (const symbol of touched) updateSinglePriceCard(symbol);
+    renderAlerts();
   } finally {
     futuresRestBusy = false;
     scheduleFuturesRestFallback(2500);
@@ -720,6 +761,7 @@ function scheduleBackendQuotePoll(delay=2000) {
 function applyBackendQuotes(quotes) {
   let got = 0;
   let marketChanged = false;
+  const touched = [];
   for (const symbol of symbols) {
     const q = quotes?.[symbol];
     const price = Number(q?.price);
@@ -733,10 +775,12 @@ function applyBackendQuotes(quotes) {
       updatedAt:Date.now(), market
     };
     got += 1;
+    touched.push(symbol);
     checkAlerts(symbol, price);
   }
   if (marketChanged) saveState(false);
-  renderPrices(); renderAlerts();
+  for (const symbol of touched) updateSinglePriceCard(symbol);
+  renderAlerts();
   return got;
 }
 function hasFreshPrice(maxAge=10000) {

@@ -42,3 +42,8 @@ input,select{width:100%;border:1px solid #303644;background:#0c0f15;color:var(--
 .chart-status{margin:8px 2px 0;color:var(--muted);font-size:12px;line-height:1.45}.chart-status.loading{color:#d4b45f}.chart-status.error{color:#ff8c85}
 @media (min-width:760px){.kline-shell{height:420px}}
 @media (max-width:560px){.kline-shell{height:350px}.chart-toolbar{align-items:flex-start}.chart-interval,.chart-tool{min-height:32px;padding:0 8px;font-size:11px}.chart-intervals{gap:5px}.chart-ohlc{font-size:10px}}
+
+/* v14 stability: keep canvases on a stable compositing layer on iPad/Safari. */
+.kline-shell{contain:layout paint;isolation:isolate}
+.kline-canvas{backface-visibility:hidden;-webkit-backface-visibility:hidden;transform:translateZ(0)}
+@supports (-webkit-touch-callout:none){.panel{backdrop-filter:none;-webkit-backdrop-filter:none}}
