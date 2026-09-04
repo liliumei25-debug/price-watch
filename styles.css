@@ -45,5 +45,8 @@ input,select{width:100%;border:1px solid #303644;background:#0c0f15;color:var(--
 
 /* v14 stability: keep canvases on a stable compositing layer on iPad/Safari. */
 .kline-shell{contain:layout paint;isolation:isolate}
-.kline-canvas{backface-visibility:hidden;-webkit-backface-visibility:hidden;transform:translateZ(0)}
+.kline-canvas{backface-visibility:hidden;-webkit-backface-visibility:hidden;will-change:auto}
 @supports (-webkit-touch-callout:none){.panel{backdrop-filter:none;-webkit-backdrop-filter:none}}
+
+/* v15: avoid Safari layer churn while live prices update. */
+.kline-shell{transform:none;-webkit-transform:none}

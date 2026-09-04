@@ -200,6 +200,8 @@ function saveExpandedCharts() {
 const CHART_INTERVALS = ['5m','15m','30m','1h','2h','4h','1d'];
 const CHART_INTERVAL_LABELS = {'5m':'5m','15m':'15m','30m':'30m','1h':'1H','2h':'2H','4h':'4H','1d':'1D'};
 const CHART_LIMIT = 260;
+const LIVE_CHART_DRAW_MS = 700;
+const CHART_REFRESH_MS = 120000;
 
 function chartIntervalFor(symbol) {
   const saved = chartIntervals?.[symbol];
@@ -267,6 +269,8 @@ function cleanupChartState(symbol) {
   const state = chartStates.get(symbol);
   if (!state) return;
   try { state.resizeObserver?.disconnect(); } catch {}
+  try { state.intersectionObserver?.disconnect(); } catch {}
+  clearTimeout(state.drawTimer);
   chartStates.delete(symbol);
 }
 function ensureChartState(symbol, card) {
@@ -276,21 +280,35 @@ function ensureChartState(symbol, card) {
   if (state) cleanupChartState(symbol);
   state = {
     symbol, card, canvas, ctx:canvas.getContext('2d'), data:[], interval:chartIntervalFor(symbol),
-    visibleCount:80, rightOffset:0, hoverIndex:null, hoverY:null, loading:false, requestId:0, drawPending:false,
+    visibleCount:80, rightOffset:0, hoverIndex:null, hoverY:null, loading:false, requestId:0,
+    drawPending:false, drawTimer:null, lastDrawAt:0, lastCssW:0, lastCssH:0, lastDpr:0, isVisible:true,
+    buffer:document.createElement('canvas'), bufferCtx:null,
     pointers:new Map(), dragStartX:0, dragStartOffset:0, pinchStartDistance:0, pinchStartCount:80
   };
-  const draw = ()=>drawKlineChart(state);
+  state.bufferCtx = state.buffer.getContext('2d');
+  const draw = ()=>scheduleChartDraw(state, 0, true);
   if ('ResizeObserver' in window) {
-    state.resizeObserver = new ResizeObserver(draw);
+    state.resizeObserver = new ResizeObserver(entries=>{
+      const r=entries?.[0]?.contentRect;
+      if(!r) return;
+      if(Math.abs(r.width-state.lastCssW)>1 || Math.abs(r.height-state.lastCssH)>1) draw();
+    });
     state.resizeObserver.observe(canvas.parentElement);
   } else window.addEventListener('resize', draw);
+  if ('IntersectionObserver' in window) {
+    state.intersectionObserver = new IntersectionObserver(entries=>{
+      state.isVisible = Boolean(entries?.[0]?.isIntersecting);
+      if(state.isVisible) scheduleChartDraw(state,0,true);
+    },{root:null,rootMargin:'120px 0px'});
+    state.intersectionObserver.observe(canvas.parentElement);
+  }
 
   canvas.addEventListener('wheel', e=>{
     e.preventDefault();
     const delta = e.deltaY > 0 ? 10 : -10;
     state.visibleCount = Math.max(20, Math.min(Math.min(180,state.data.length||180), state.visibleCount + delta));
     state.rightOffset = Math.min(state.rightOffset, Math.max(0,(state.data.length||0)-state.visibleCount));
-    draw();
+    scheduleChartDraw(state,0,true);
   }, {passive:false});
   canvas.addEventListener('pointerdown', e=>{
     canvas.setPointerCapture?.(e.pointerId);
@@ -320,12 +338,12 @@ function ensureChartState(symbol, card) {
       state.rightOffset=Math.max(0,Math.min(Math.max(0,state.data.length-state.visibleCount),state.dragStartOffset+shift));
     }
     updateHoverIndex(state,e.clientX-rect.left);
-    draw();
+    scheduleChartDraw(state,0,true);
   });
   const endPointer=e=>{ state.pointers.delete(e.pointerId); if(!state.pointers.size){state.dragStartX=0;} };
   canvas.addEventListener('pointerup',endPointer);
   canvas.addEventListener('pointercancel',endPointer);
-  canvas.addEventListener('pointerleave',e=>{ if(!state.pointers.size){state.hoverIndex=null; state.hoverY=null; draw();} });
+  canvas.addEventListener('pointerleave',e=>{ if(!state.pointers.size){state.hoverIndex=null; state.hoverY=null; scheduleChartDraw(state,0,true);} });
   return state;
 }
 function visibleSlice(state) {
@@ -358,43 +376,60 @@ function formatChartTime(ms, interval) {
 }
 function drawKlineChart(state) {
   const canvas=state.canvas;
-  if (!canvas || !canvas.isConnected) return;
+  if (!canvas || !canvas.isConnected || state.isVisible===false) return;
   const rect=canvas.getBoundingClientRect();
-  const cssW=Math.max(280,Math.floor(rect.width)), cssH=Math.max(260,Math.floor(rect.height));
+  const measuredW=Math.max(280,Math.round(rect.width)), measuredH=Math.max(260,Math.round(rect.height));
   const dpr=Math.min(2,window.devicePixelRatio||1);
-  if(canvas.width!==Math.round(cssW*dpr)||canvas.height!==Math.round(cssH*dpr)){canvas.width=Math.round(cssW*dpr);canvas.height=Math.round(cssH*dpr);}
-  const ctx=state.ctx; ctx.setTransform(dpr,0,0,dpr,0,0); ctx.clearRect(0,0,cssW,cssH);
-  ctx.fillStyle='#0b0d12'; ctx.fillRect(0,0,cssW,cssH);
+  const sizeChanged=!state.lastCssW || Math.abs(measuredW-state.lastCssW)>1 || Math.abs(measuredH-state.lastCssH)>1 || Math.abs(dpr-state.lastDpr)>.01;
+  const cssW=sizeChanged?measuredW:state.lastCssW, cssH=sizeChanged?measuredH:state.lastCssH;
+  const pxW=Math.round(cssW*dpr), pxH=Math.round(cssH*dpr);
+  if(sizeChanged){
+    state.lastCssW=cssW;state.lastCssH=cssH;state.lastDpr=dpr;
+    if(canvas.width!==pxW)canvas.width=pxW;
+    if(canvas.height!==pxH)canvas.height=pxH;
+    state.buffer.width=pxW;state.buffer.height=pxH;
+  } else if(state.buffer.width!==pxW||state.buffer.height!==pxH){
+    state.buffer.width=pxW;state.buffer.height=pxH;
+  }
+  const ctx=state.bufferCtx;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle='#0b0d12';ctx.fillRect(0,0,cssW,cssH);
   const left=8,right=68,top=20,bottom=30,plotW=cssW-left-right,plotH=cssH-top-bottom;
   ctx.strokeStyle='rgba(143,151,168,.13)';ctx.lineWidth=1;
   for(let i=0;i<=5;i++){const y=top+plotH*i/5;ctx.beginPath();ctx.moveTo(left,y+.5);ctx.lineTo(left+plotW,y+.5);ctx.stroke();}
   for(let i=0;i<=5;i++){const x=left+plotW*i/5;ctx.beginPath();ctx.moveTo(x+.5,top);ctx.lineTo(x+.5,top+plotH);ctx.stroke();}
   const {rows,start}=visibleSlice(state);
-  if (!rows.length) return;
-  let min=Math.min(...rows.map(k=>k.low)), max=Math.max(...rows.map(k=>k.high));
-  let range=Math.max(1e-9,max-min); const pad=range*.07; min-=pad; max+=pad; range=max-min;
-  const yOf=p=>top+(max-p)/range*plotH;
-  ctx.font='11px -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif';ctx.textAlign='left';ctx.textBaseline='middle';ctx.fillStyle='#8f97a8';
-  for(let i=0;i<=5;i++){const p=max-range*i/5;const y=top+plotH*i/5;ctx.fillText(formatAxisPrice(p,range),left+plotW+7,y);}
-  const step=plotW/rows.length, bodyW=Math.max(1,Math.min(12,step*.68));
-  rows.forEach((k,i)=>{
-    const x=left+step*(i+.5), yo=yOf(k.open), yc=yOf(k.close), yh=yOf(k.high), yl=yOf(k.low);
-    const up=k.close>=k.open, color=up?'#34c759':'#ff453a';ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(x,yh);ctx.lineTo(x,yl);ctx.stroke();
-    const y=Math.min(yo,yc), h=Math.max(1,Math.abs(yc-yo));ctx.fillRect(x-bodyW/2,y,bodyW,h);
-  });
-  ctx.textAlign='center';ctx.textBaseline='top';ctx.fillStyle='#8f97a8';
-  const marks=[0,.25,.5,.75,1];
-  marks.forEach(frac=>{const i=Math.min(rows.length-1,Math.round((rows.length-1)*frac));const x=left+step*(i+.5);ctx.fillText(formatChartTime(rows[i].time,state.interval),x,top+plotH+8);});
-  if (state.hoverIndex!=null && state.hoverIndex>=start && state.hoverIndex<start+rows.length) {
-    const local=state.hoverIndex-start,k=state.data[state.hoverIndex],x=left+step*(local+.5);const y=Math.max(top,Math.min(top+plotH,state.hoverY??yOf(k.close)));
-    ctx.strokeStyle='rgba(244,246,251,.42)';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,top+plotH);ctx.moveTo(left,y);ctx.lineTo(left+plotW,y);ctx.stroke();ctx.setLineDash([]);
-    const hover=state.card.querySelector('[data-role="chart-ohlc"]');
-    if(hover) hover.textContent=`${formatChartTime(k.time,state.interval)}  O ${formatPrice(k.open)}  H ${formatPrice(k.high)}  L ${formatPrice(k.low)}  C ${formatPrice(k.close)}`;
-  } else {
-    const last=rows[rows.length-1]; const hover=state.card.querySelector('[data-role="chart-ohlc"]');
-    if(hover) hover.textContent=`O ${formatPrice(last.open)}  H ${formatPrice(last.high)}  L ${formatPrice(last.low)}  C ${formatPrice(last.close)}`;
+  if (rows.length) {
+    let min=Math.min(...rows.map(k=>k.low)), max=Math.max(...rows.map(k=>k.high));
+    let range=Math.max(1e-9,max-min); const pad=range*.07; min-=pad; max+=pad; range=max-min;
+    const yOf=p=>top+(max-p)/range*plotH;
+    ctx.font='11px -apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC",sans-serif';ctx.textAlign='left';ctx.textBaseline='middle';ctx.fillStyle='#8f97a8';
+    for(let i=0;i<=5;i++){const p=max-range*i/5;const y=top+plotH*i/5;ctx.fillText(formatAxisPrice(p,range),left+plotW+7,y);}
+    const step=plotW/rows.length, bodyW=Math.max(1,Math.min(12,step*.68));
+    rows.forEach((k,i)=>{
+      const x=left+step*(i+.5), yo=yOf(k.open), yc=yOf(k.close), yh=yOf(k.high), yl=yOf(k.low);
+      const up=k.close>=k.open, color=up?'#34c759':'#ff453a';ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=1;
+      ctx.beginPath();ctx.moveTo(x,yh);ctx.lineTo(x,yl);ctx.stroke();
+      const y=Math.min(yo,yc), h=Math.max(1,Math.abs(yc-yo));ctx.fillRect(x-bodyW/2,y,bodyW,h);
+    });
+    ctx.textAlign='center';ctx.textBaseline='top';ctx.fillStyle='#8f97a8';
+    [0,.25,.5,.75,1].forEach(frac=>{const i=Math.min(rows.length-1,Math.round((rows.length-1)*frac));const x=left+step*(i+.5);ctx.fillText(formatChartTime(rows[i].time,state.interval),x,top+plotH+8);});
+    if (state.hoverIndex!=null && state.hoverIndex>=start && state.hoverIndex<start+rows.length) {
+      const local=state.hoverIndex-start,k=state.data[state.hoverIndex],x=left+step*(local+.5);const y=Math.max(top,Math.min(top+plotH,state.hoverY??yOf(k.close)));
+      ctx.strokeStyle='rgba(244,246,251,.42)';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,top+plotH);ctx.moveTo(left,y);ctx.lineTo(left+plotW,y);ctx.stroke();ctx.setLineDash([]);
+      const hover=state.card.querySelector('[data-role="chart-ohlc"]');
+      if(hover) hover.textContent=`${formatChartTime(k.time,state.interval)}  O ${formatPrice(k.open)}  H ${formatPrice(k.high)}  L ${formatPrice(k.low)}  C ${formatPrice(k.close)}`;
+    } else {
+      const last=rows[rows.length-1]; const hover=state.card.querySelector('[data-role="chart-ohlc"]');
+      if(hover) hover.textContent=`O ${formatPrice(last.open)}  H ${formatPrice(last.high)}  L ${formatPrice(last.low)}  C ${formatPrice(last.close)}`;
+    }
   }
+  const out=state.ctx;
+  out.setTransform(1,0,0,1,0,0);
+  out.globalCompositeOperation='copy';
+  out.drawImage(state.buffer,0,0);
+  out.globalCompositeOperation='source-over';
+  state.lastDrawAt=performance.now();
 }
 async function loadKlineChart(symbol, card, {resetView=false,force=false}={}) {
   const state=ensureChartState(symbol,card); const interval=chartIntervalFor(symbol);
@@ -415,13 +450,24 @@ async function loadKlineChart(symbol, card, {resetView=false,force=false}={}) {
     drawKlineChart(state);
   } finally {if(requestId===state.requestId)state.loading=false;}
 }
-function scheduleChartDraw(state) {
-  if (!state || state.drawPending) return;
-  state.drawPending = true;
-  requestAnimationFrame(() => {
-    state.drawPending = false;
-    drawKlineChart(state);
-  });
+function scheduleChartDraw(state, minDelay=LIVE_CHART_DRAW_MS, immediate=false) {
+  if (!state || state.isVisible===false) return;
+  const now=performance.now();
+  if(immediate || minDelay<=0){
+    clearTimeout(state.drawTimer);state.drawTimer=null;
+    if(state.drawPending)return;
+    state.drawPending=true;
+    requestAnimationFrame(()=>{state.drawPending=false;drawKlineChart(state);});
+    return;
+  }
+  if(state.drawTimer || state.drawPending)return;
+  const wait=Math.max(0,minDelay-(now-(state.lastDrawAt||0)));
+  state.drawTimer=setTimeout(()=>{
+    state.drawTimer=null;
+    if(state.drawPending)return;
+    state.drawPending=true;
+    requestAnimationFrame(()=>{state.drawPending=false;drawKlineChart(state);});
+  },wait);
 }
 function updateOpenChartLive(symbol) {
   const state=chartStates.get(symbol); const price=Number(prices[symbol]?.price);
@@ -442,7 +488,7 @@ function scheduleChartRefresh() {
   chartRefreshTimer=setInterval(()=>{
     if(document.visibilityState==='hidden')return;
     for(const symbol of expandedCharts){const card=el.priceList.querySelector(`[data-price-card-symbol="${CSS.escape(symbol)}"]`);if(card)loadKlineChart(symbol,card,{force:true}).catch(()=>{});}
-  },30000);
+  },CHART_REFRESH_MS);
 }
 function createPriceCard(symbol) {
   const card = document.createElement('article');
@@ -451,7 +497,7 @@ function createPriceCard(symbol) {
   card.innerHTML = `<div class="price-main"><div><div class="symbol" data-role="symbol"></div><div class="pair-sub" data-role="market"></div></div><div><div class="price-value" data-role="price">—</div><div class="change" data-role="change">等待行情…</div></div></div><div class="row-actions price-actions"><button class="ghost chart-toggle" data-action="toggle-chart" data-symbol="${symbol}">展开图表</button><button class="ghost" data-action="quick-alert" data-symbol="${symbol}">设提醒</button><button class="danger compact-danger" data-action="remove-symbol" data-symbol="${symbol}">移除</button></div><div class="chart-wrap" data-role="chart-wrap" hidden><div class="chart-toolbar"><div class="chart-intervals">${chartButtonsHtml(symbol)}</div><div class="chart-tools"><button type="button" class="chart-tool" data-action="chart-zoom-in" data-symbol="${symbol}" aria-label="放大">＋</button><button type="button" class="chart-tool" data-action="chart-zoom-out" data-symbol="${symbol}" aria-label="缩小">－</button><button type="button" class="chart-tool reset" data-action="chart-reset" data-symbol="${symbol}">最新</button></div></div><div class="kline-shell"><canvas class="kline-canvas" data-role="kline-canvas" aria-label="${symbol} K线图"></canvas><div class="chart-ohlc" data-role="chart-ohlc"></div></div><div class="chart-status" data-role="chart-status">展开后加载 K 线</div></div>`;
   return card;
 }
-function updatePriceCard(card, symbol) {
+function updatePriceValues(card, symbol) {
   const data = prices[symbol], change = data?.changePct ?? null;
   const changeClass = change > 0 ? 'up' : change < 0 ? 'down' : '';
   const changeText = change == null ? '等待行情…' : `${change > 0 ? '+' : ''}${change.toFixed(2)}% · 24h`;
@@ -460,6 +506,9 @@ function updatePriceCard(card, symbol) {
   card.querySelector('[data-role="price"]').textContent = data ? '$'+formatPrice(data.price) : '—';
   const changeEl = card.querySelector('[data-role="change"]');
   changeEl.className = `change ${changeClass}`.trim(); changeEl.textContent = changeText;
+}
+function updatePriceCard(card, symbol) {
+  updatePriceValues(card,symbol);
   const wrap = card.querySelector('[data-role="chart-wrap"]'), btn = card.querySelector('[data-action="toggle-chart"]'), open = expandedCharts.has(symbol);
   const wasHidden = wrap.hidden;
   wrap.hidden = !open; btn.textContent = open ? '收起图表' : '展开图表'; btn.setAttribute('aria-expanded', String(open));
@@ -467,14 +516,16 @@ function updatePriceCard(card, symbol) {
   if (open) {
     const state=chartStates.get(symbol);
     if (!state || !state.data.length || state.interval!==interval) loadKlineChart(symbol,card).catch(()=>{});
-    else if (wasHidden) scheduleChartDraw(state);
+    else if (wasHidden) scheduleChartDraw(state,0,true);
     updateOpenChartLive(symbol);
   }
 }
 function updateSinglePriceCard(symbol) {
   const card = el.priceList.querySelector(`[data-price-card-symbol="${CSS.escape(symbol)}"]`);
   if (!card) { renderPrices(); return; }
-  updatePriceCard(card, symbol);
+  // 实时行情只更新数字与最后一根 K 线，不再反复触碰图表布局和周期按钮。
+  updatePriceValues(card,symbol);
+  updateOpenChartLive(symbol);
 }
 function renderPrices() {
   if (!symbols.length) {
@@ -1034,7 +1085,7 @@ el.priceList.addEventListener('click',event=>{
     const card=btn.closest('[data-price-card-symbol]'),state=chartStates.get(symbol)|| (card?ensureChartState(symbol,card):null); if(!state)return;
     if(btn.dataset.action==='chart-reset'){state.visibleCount=Math.min(80,state.data.length||80);state.rightOffset=0;}
     else {const delta=btn.dataset.action==='chart-zoom-in'?-12:12;state.visibleCount=Math.max(20,Math.min(Math.min(180,state.data.length||180),state.visibleCount+delta));state.rightOffset=Math.min(state.rightOffset,Math.max(0,(state.data.length||0)-state.visibleCount));}
-    drawKlineChart(state); return;
+    scheduleChartDraw(state,0,true); return;
   }
   if(btn.dataset.action==='remove-symbol'){
     const symbolIndex=symbols.indexOf(symbol);
