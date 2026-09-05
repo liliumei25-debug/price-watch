@@ -7,9 +7,11 @@ const STORAGE = {
   clientId: 'pricewatch_client_id_v2',
   markets: 'pricewatch_markets_v3',
   expandedCharts: 'pricewatch_expanded_charts_v1',
-  chartIntervals: 'pricewatch_chart_intervals_v1'
+  chartIntervals: 'pricewatch_chart_intervals_v1',
+  stateUpdatedAt: 'pricewatch_state_updated_at_v1'
 };
 
+const HAD_LOCAL_STATE_ON_LOAD = localStorage.getItem(STORAGE.symbols)!==null || localStorage.getItem(STORAGE.alerts)!==null;
 const VAPID_PUBLIC_KEY = 'BDOPB7t_5ss8hWCqrcCZO-fj3CM87At5ytLrA-dcek75GptW7kg-ZD3XC2i9vMHeMN2f3jQ_0FC2bMajAG-NzrE';
 const DEFAULT_SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
 // Binance TradFi USDⓈ-M perpetuals that should be treated as futures even when REST market detection is unavailable.
@@ -34,6 +36,9 @@ let expandedCharts = new Set(loadJSON(STORAGE.expandedCharts, []));
 let chartIntervals = loadJSON(STORAGE.chartIntervals, {});
 const chartStates = new Map();
 let chartRefreshTimer = null;
+let stateUpdatedAt = Number(localStorage.getItem(STORAGE.stateUpdatedAt) || 0) || 0;
+const IDB_NAME = 'pricewatch_persistent_v1';
+const IDB_STORE = 'state';
 
 const el = {
   priceList: document.querySelector('#priceList'), alertList: document.querySelector('#alertList'),
@@ -55,6 +60,69 @@ function loadJSON(key, fallback) {
   try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : structuredClone(fallback); }
   catch { return structuredClone(fallback); }
 }
+function openStateDB() {
+  return new Promise((resolve, reject) => {
+    if (!('indexedDB' in window)) return reject(new Error('IndexedDB unavailable'));
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+  });
+}
+async function readIndexedSnapshot() {
+  try {
+    const db = await openStateDB();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get('main');
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => db.close();
+    });
+  } catch { return null; }
+}
+async function writeIndexedSnapshot(snapshot) {
+  try {
+    const db = await openStateDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(snapshot, 'main');
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  } catch (e) { console.warn('IndexedDB snapshot failed', e); }
+}
+function currentSnapshot() {
+  return {
+    symbols:[...symbols], alerts:alerts.map(a=>({...a})), markets:{...markets},
+    updatedAt:Number(stateUpdatedAt)||Date.now()
+  };
+}
+function persistLocalSnapshot() {
+  localStorage.setItem(STORAGE.symbols, JSON.stringify(symbols));
+  localStorage.setItem(STORAGE.alerts, JSON.stringify(alerts));
+  localStorage.setItem(STORAGE.markets, JSON.stringify(markets));
+  localStorage.setItem(STORAGE.stateUpdatedAt, String(stateUpdatedAt || Date.now()));
+  writeIndexedSnapshot(currentSnapshot());
+}
+function applyFullSnapshot(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.symbols)) return false;
+  const nextSymbols=[...new Set(snapshot.symbols.map(normalizeSymbol).filter(Boolean))];
+  const nextAlerts=Array.isArray(snapshot.alerts)?snapshot.alerts.map(a=>({...a,symbol:normalizeSymbol(a.symbol)})).filter(a=>a.symbol):[];
+  const nextMarkets={};
+  for (const [k,v] of Object.entries(snapshot.markets||{})) {
+    const nk=normalizeSymbol(k); if(nk&&(v==='spot'||v==='futures')) nextMarkets[nk]=v;
+  }
+  symbols=nextSymbols; alerts=nextAlerts; markets=nextMarkets;
+  for (const symbol of symbols) if (KNOWN_FUTURES_SYMBOLS.has(symbol)) markets[symbol]='futures';
+  stateUpdatedAt=Number(snapshot.updatedAt)||Date.now();
+  persistLocalSnapshot();
+  return true;
+}
 function getClientId() {
   let id = localStorage.getItem(STORAGE.clientId);
   if (!id) { id = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`; localStorage.setItem(STORAGE.clientId, id); }
@@ -64,9 +132,8 @@ function backendConfig() {
   return { url: (localStorage.getItem(STORAGE.backendUrl) || '').replace(/\/+$/, ''), token: localStorage.getItem(STORAGE.backendToken) || '' };
 }
 function saveState(sync = true) {
-  localStorage.setItem(STORAGE.symbols, JSON.stringify(symbols));
-  localStorage.setItem(STORAGE.alerts, JSON.stringify(alerts));
-  localStorage.setItem(STORAGE.markets, JSON.stringify(markets));
+  stateUpdatedAt = Date.now();
+  persistLocalSnapshot();
   if (sync) scheduleBackendSync();
 }
 function marketLabel(symbol) {
@@ -989,21 +1056,61 @@ async function getPushSubscription(createIfMissing=false) {
 }
 async function registerBackend(createSubscription=false) {
   const sub=await getPushSubscription(createSubscription); if(!sub) throw new Error('还没有 Web Push 订阅，请点“设置后台”');
-  await backendFetch('/api/register',{method:'POST',body:JSON.stringify({clientId:getClientId(),subscription:sub.toJSON?sub.toJSON():sub,alerts,appUrl:location.origin})});
+  await backendFetch('/api/register',{method:'POST',body:JSON.stringify({clientId:getClientId(),subscription:sub.toJSON?sub.toJSON():sub,alerts,symbols,markets,updatedAt:stateUpdatedAt,appUrl:location.origin})});
   const status=await backendFetch(`/api/status?clientId=${encodeURIComponent(getClientId())}`);
   if(!status.registered) throw new Error('Web Push 订阅未写入后台');
   return status;
 }
 function scheduleBackendSync() {
   clearTimeout(backendSyncTimer); const cfg=backendConfig(); if(!cfg.url||!cfg.token) return;
-  backendSyncTimer=setTimeout(async()=>{ try { const sub=await getPushSubscription(false); if(sub) await backendFetch('/api/alerts',{method:'POST',body:JSON.stringify({clientId:getClientId(),alerts,appUrl:location.origin})}); } catch(e){ console.warn('Backend sync failed',e); } },500);
+  backendSyncTimer=setTimeout(async()=>{ try { const sub=await getPushSubscription(false); if(sub) await backendFetch('/api/alerts',{method:'POST',body:JSON.stringify({clientId:getClientId(),alerts,symbols,markets,updatedAt:stateUpdatedAt,appUrl:location.origin})}); } catch(e){ console.warn('Backend sync failed',e); } },500);
 }
 async function pullBackendState() {
   const data = await backendFetch(`/api/state?clientId=${encodeURIComponent(getClientId())}`);
-  if (!Array.isArray(data.alerts)) return;
-  const remote = new Map(data.alerts.map(a=>[a.id,a])); let changed=false;
-  alerts = alerts.map(a=>{ const r=remote.get(a.id); if(!r) return a; if(Boolean(a.triggered)!==Boolean(r.triggered) || Boolean(a.enabled)!==Boolean(r.enabled) || a.triggeredAt!==r.triggeredAt){ changed=true; return {...a,triggered:Boolean(r.triggered),enabled:Boolean(r.enabled),triggeredAt:r.triggeredAt||a.triggeredAt}; } return a; });
-  if(changed){ saveState(false); renderAlerts(); }
+  const remoteUpdatedAt=Number(data.updatedAt)||0;
+  // New backend: complete state can restore a browser/PWA whose site storage was lost.
+  if (Array.isArray(data.symbols) && remoteUpdatedAt > stateUpdatedAt) {
+    applyFullSnapshot({symbols:data.symbols,alerts:data.alerts||[],markets:data.markets||{},updatedAt:remoteUpdatedAt});
+    renderPrices(); renderAlerts(); renderAlertSymbolOptions();
+    return;
+  }
+  // Backward-compatible alert status merge for older backend state.
+  if (Array.isArray(data.alerts)) {
+    const remote = new Map(data.alerts.map(a=>[a.id,a])); let changed=false;
+    alerts = alerts.map(a=>{ const r=remote.get(a.id); if(!r) return a; if(Boolean(a.triggered)!==Boolean(r.triggered) || Boolean(a.enabled)!==Boolean(r.enabled) || a.triggeredAt!==r.triggeredAt){ changed=true; return {...a,triggered:Boolean(r.triggered),enabled:Boolean(r.enabled),triggeredAt:r.triggeredAt||a.triggeredAt}; } return a; });
+    if(changed){ stateUpdatedAt=Math.max(stateUpdatedAt,remoteUpdatedAt||Date.now()); persistLocalSnapshot(); renderAlerts(); }
+  }
+  // Local state is newer, push it back so a stale server can never resurrect deleted items.
+  if (stateUpdatedAt > remoteUpdatedAt) scheduleBackendSync();
+}
+async function restoreDurableState() {
+  const hadLocal = HAD_LOCAL_STATE_ON_LOAD;
+  const localCandidate = hadLocal ? currentSnapshot() : null;
+  const indexedCandidate = await readIndexedSnapshot();
+  let remoteCandidate = null;
+  const cfg=backendConfig();
+  if(cfg.url&&cfg.token){
+    try{
+      const data=await backendFetch(`/api/state?clientId=${encodeURIComponent(getClientId())}`);
+      if(Array.isArray(data.symbols)) remoteCandidate={symbols:data.symbols,alerts:data.alerts||[],markets:data.markets||{},updatedAt:Number(data.updatedAt)||0};
+    }catch(e){console.warn('Remote restore unavailable',e);}
+  }
+  const candidates=[localCandidate,indexedCandidate,remoteCandidate].filter(x=>x&&Array.isArray(x.symbols));
+  if(candidates.length){
+    candidates.sort((a,b)=>(Number(b.updatedAt)||0)-(Number(a.updatedAt)||0));
+    const best=candidates[0];
+    // Existing v16 local data has no revision yet. Preserve it as the authoritative first v17 snapshot.
+    if(localCandidate && !Number(localStorage.getItem(STORAGE.stateUpdatedAt)||0)) {
+      stateUpdatedAt=Date.now(); persistLocalSnapshot();
+    } else if(best!==localCandidate || !hadLocal) {
+      applyFullSnapshot(best);
+    } else {
+      stateUpdatedAt=Number(best.updatedAt)||Date.now(); persistLocalSnapshot();
+    }
+  } else {
+    stateUpdatedAt=Date.now(); persistLocalSnapshot();
+  }
+  if(navigator.storage?.persist){ try{ await navigator.storage.persist(); }catch{} }
 }
 function setBackendUI(state,text) {
   el.backendHint.textContent=text; el.backendHint.className = state==='good'?'backend-good':state==='bad'?'backend-bad':'backend-warn';
@@ -1157,4 +1264,15 @@ window.addEventListener('online',()=>{connectSocket();refreshBackendStatus();});
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'){const cfg=backendConfig();const active=Object.values(sockets).some(ws=>ws&&ws.readyState===1);if((cfg.url&&cfg.token)||!active)connectSocket();refreshBackendStatus();}else{stopBackendQuotePolling();}});
 if('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').then(()=>refreshBackendStatus()).catch(console.warn));
 
-renderPrices(); renderAlerts(); renderAlertSymbolOptions(); updateNotificationUI(); connectSocket(); getClientId(); scheduleChartRefresh();
+async function bootApp() {
+  await restoreDurableState();
+  renderPrices(); renderAlerts(); renderAlertSymbolOptions(); updateNotificationUI();
+  connectSocket(); getClientId(); scheduleChartRefresh();
+  // Seed all three persistence layers after an upgrade without changing user data.
+  persistLocalSnapshot();
+  const cfg=backendConfig(); if(cfg.url&&cfg.token) scheduleBackendSync();
+}
+bootApp().catch(e=>{
+  console.warn('Durable boot failed',e);
+  renderPrices(); renderAlerts(); renderAlertSymbolOptions(); updateNotificationUI(); connectSocket(); getClientId(); scheduleChartRefresh();
+});
